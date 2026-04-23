@@ -35,7 +35,7 @@ const costSchema = z.object({
 const orderSchema = z.object({
   flavorId: z.number().int(),
   qty: z.number().int().positive(),
-  paymentMethod: z.string().min(2),
+  paymentMethod: z.enum(['point', 'pix', 'dinheiro']),
 })
 
 const paymentIntentSchema = z.object({
@@ -183,6 +183,20 @@ app.patch('/api/orders/:id/status', async (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found' })
     return res.json(order)
   } catch {
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.delete('/api/orders/:id', async (req, res) => {
+  const orderId = Number(req.params.id)
+  if (Number.isNaN(orderId)) return res.status(400).json({ error: 'Invalid order id' })
+  try {
+    const result = await store.cancelOrder(orderId)
+    if (!result) return res.status(404).json({ error: 'Order not found' })
+    if (result.error) return res.status(400).json({ error: result.error })
+    return res.json(result)
+  } catch (err) {
+    console.error('[DELETE /api/orders/:id] erro:', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
 })

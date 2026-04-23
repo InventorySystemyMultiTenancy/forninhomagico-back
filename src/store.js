@@ -89,7 +89,7 @@ async function createCost(payload) {
 // ─── Orders ───────────────────────────────────────────────────────────────────
 
 const ORDER_SELECT = `
-  SELECT o.id, o.order_code, o.status, o.total_cents, o.created_at, o.paid_at,
+  SELECT o.id, o.order_code, o.payment_method, o.status, o.total_cents, o.created_at, o.paid_at,
          o.payment_intent_id, oi.flavor_id, f.name AS flavor_name, oi.qty
   FROM orders o
   LEFT JOIN order_items oi ON oi.order_id = o.id
@@ -99,6 +99,7 @@ function rowToOrder(row) {
   return {
     id: row.id,
     code: row.order_code,
+    paymentMethod: row.payment_method || 'point',
     flavorId: row.flavor_id || null,
     flavorName: row.flavor_name || null,
     qty: row.qty ? Number(row.qty) : null,
@@ -162,10 +163,10 @@ async function createOrder(payload) {
 
     const totalCents = payload.qty * flavor.price_cents
     const { rows: oRows } = await client.query(
-      `INSERT INTO orders (status, total_cents)
-       VALUES ($1, $2)
-       RETURNING id, order_code, status, total_cents, created_at, paid_at, payment_intent_id`,
-      ['aguardando pagamento', totalCents],
+      `INSERT INTO orders (status, total_cents, payment_method)
+       VALUES ($1, $2, $3)
+       RETURNING id, order_code, payment_method, status, total_cents, created_at, paid_at, payment_intent_id`,
+      ['aguardando pagamento', totalCents, payload.paymentMethod || 'point'],
     )
     const order = oRows[0]
 
@@ -178,6 +179,7 @@ async function createOrder(payload) {
     return {
       id: order.id,
       code: order.order_code,
+      paymentMethod: order.payment_method,
       flavorId: flavor.id,
       flavorName: flavor.name,
       qty: payload.qty,
@@ -230,6 +232,46 @@ async function updateOrderFromPayment(orderId, paymentId, status) {
   return updateOrderStatus(orderId, newStatus)
 }
 
+async function cancelOrder(orderId) {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+
+    const { rows } = await client.query(
+      `SELECT o.id, o.status, oi.flavor_id, oi.qty
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id
+       WHERE o.id = $1`,
+      [orderId],
+    )
+    if (!rows[0]) { await client.query('ROLLBACK'); return null }
+
+    const { status, flavor_id, qty } = rows[0]
+    const nonCancellable = ['em montagem', 'pronto', 'cancelado']
+    if (nonCancellable.includes(status)) {
+      await client.query('ROLLBACK')
+      return { error: `Pedido não pode ser cancelado (status: ${status})` }
+    }
+
+    // Restaura estoque se pedido ainda não foi pago
+    if (flavor_id && qty && status === 'aguardando pagamento') {
+      await client.query(
+        `UPDATE flavors SET slices_available = slices_available + $2, updated_at = NOW() WHERE id = $1`,
+        [flavor_id, qty],
+      )
+    }
+
+    await client.query(`UPDATE orders SET status = 'cancelado' WHERE id = $1`, [orderId])
+    await client.query('COMMIT')
+    return getOrder(orderId)
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
 // ─── Payments ─────────────────────────────────────────────────────────────────
 
 async function createPayment(payload) {
@@ -272,6 +314,7 @@ module.exports = {
   markOrderPaid,
   updateOrderStatus,
   updateOrderFromPayment,
+  cancelOrder,
   createPayment,
   getFinancials,
 }

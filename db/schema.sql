@@ -20,11 +20,13 @@ CREATE TABLE IF NOT EXISTS costs (
 
 CREATE TABLE IF NOT EXISTS orders (
   id SERIAL PRIMARY KEY,
-  order_code CHAR(3) NOT NULL,
+  order_code CHAR(3),
+  payment_method TEXT NOT NULL DEFAULT 'point',
   status TEXT NOT NULL,
   total_cents INTEGER NOT NULL CHECK (total_cents >= 0),
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  paid_at TIMESTAMP
+  paid_at TIMESTAMP,
+  payment_intent_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
