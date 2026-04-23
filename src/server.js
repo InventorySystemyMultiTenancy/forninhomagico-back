@@ -147,6 +147,37 @@ async function resolveOrderByPaymentFallback(payment) {
   return null
 }
 
+async function resolveOrderByPaymentIdFromIntents(paymentId) {
+  const orders = await store.listOrders()
+  const candidates = orders.filter((order) => {
+    if (!order.paymentIntentId) return false
+    if (order.status === 'cancelado') return false
+    if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado' || order.status === 'entregue') return false
+    return true
+  })
+
+  for (const order of candidates) {
+    try {
+      const intent = await mpRequest(`/point/integration-api/payment-intents/${order.paymentIntentId}`)
+      const intentPayments = []
+      if (intent?.payment?.id) intentPayments.push(String(intent.payment.id))
+      if (Array.isArray(intent?.transactions?.payments)) {
+        for (const p of intent.transactions.payments) {
+          if (p?.id) intentPayments.push(String(p.id))
+        }
+      }
+
+      if (intentPayments.includes(String(paymentId))) {
+        return order
+      }
+    } catch (err) {
+      console.warn(`[webhook] falha ao consultar intent ${order.paymentIntentId}:`, err?.payload || err?.message)
+    }
+  }
+
+  return null
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
 })
@@ -568,7 +599,10 @@ app.post('/api/notifications/mercadopago', async (req, res) => {
       const status = payment.status
       const mpPaymentId = String(payment.id)
 
-      const order = await resolveOrderByPaymentFallback(payment)
+      let order = await resolveOrderByPaymentFallback(payment)
+      if (!order) {
+        order = await resolveOrderByPaymentIdFromIntents(String(paymentId))
+      }
       if (!order) return res.status(200).json({ received: true })
 
       console.log(`[notifications] payment ${mpPaymentId} status=${status} orderId=${order.id}`)
@@ -706,7 +740,10 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
     if (!paymentId) return res.status(200).json({ received: true })
     try {
       const payment = await mpRequest(`/v1/payments/${paymentId}`)
-      const order = await resolveOrderByPaymentFallback(payment)
+      let order = await resolveOrderByPaymentFallback(payment)
+      if (!order) {
+        order = await resolveOrderByPaymentIdFromIntents(String(paymentId))
+      }
       if (!order) return res.status(200).json({ received: true })
       const updated = await store.updateOrderFromPayment(order.id, String(payment.id), payment.status)
       if (payment.status === 'approved') {
