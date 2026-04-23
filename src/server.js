@@ -90,7 +90,24 @@ async function mpRequest(path, options = {}) {
   })
 
   const text = await response.text()
-  const data = text ? JSON.parse(text) : null
+  let data = null
+
+  // Tenta fazer parse JSON, mas se falhar e for HTML, lida com graciosidade
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch (parseErr) {
+    // Se não consegue fazer parse (ex: HTML), cria objeto de erro
+    if (text?.startsWith('<!DOCTYPE') || text?.startsWith('<html')) {
+      console.warn(`[mpRequest] resposta HTML recebida de ${path}:`, text.substring(0, 200))
+      data = {
+        error: 'INVALID_RESPONSE_FORMAT',
+        message: `API retornou HTML em vez de JSON (status: ${response.status}). Possível erro 404, 401 ou timeout.`,
+        response_snippet: text.substring(0, 100)
+      }
+    } else {
+      throw parseErr
+    }
+  }
 
   if (!response.ok) {
     const error = new Error('Mercado Pago request failed')
@@ -354,15 +371,33 @@ app.patch('/api/orders/:id/status', async (req, res) => {
 
 async function clearPosOrder() {
   const { collectorId, qrStoreId, qrExternalPosId } = config.mercadoPago
-  if (!collectorId || !qrStoreId || !qrExternalPosId) return
+  if (!collectorId || !qrStoreId || !qrExternalPosId) {
+    console.log('[pos] QR não configurado, pulando limpeza')
+    return
+  }
   try {
     await mpRequest(
       `/instore/qr/seller/collectors/${collectorId}/stores/${qrStoreId}/pos/${qrExternalPosId}/orders`,
       { method: 'DELETE' },
     )
-    console.log('[pos] QR order limpo')
+    console.log('[pos] QR order limpo com sucesso')
   } catch (err) {
-    console.warn('[pos] falha ao limpar QR order:', err?.payload || err?.message)
+    // QR cleanup é opcionl (usado para pagamentos por QR, não para Point)
+    // Não falha se error (pode ser 404 se QR não existe, ou credenciais inválidas)
+    if (err?.status === 404) {
+      console.log('[pos] QR order não encontrado (normal se está usando Point)')
+      return
+    }
+    if (err?.status === 401) {
+      console.warn('[pos] credenciais inválidas para QR, verifique config.mercadoPago.collectorId/qrStoreId/qrExternalPosId')
+      return
+    }
+    // Para outros erros (HTML, timeout, etc), apenas loga e não bloqueia
+    console.warn('[pos] falha ao limpar QR order (não crítico):', {
+      status: err?.status,
+      message: err?.message?.substring(0, 100),
+      hint: 'Se está usando Point, QR cleanup pode ser ignorado com segurança'
+    })
   }
 }
 
