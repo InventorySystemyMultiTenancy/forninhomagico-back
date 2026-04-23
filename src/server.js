@@ -548,15 +548,14 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
       console.warn('[clear-queue] não conseguiu listar intents da API:', err?.payload || err?.message)
     }
 
-    // Limpa QR order também
-    await clearPosOrder()
-
-    // Limpa TODOS os paymentIntentId do banco
+    // Fallback importante: tenta cancelar intents já vinculados no banco
+    // (quando listagem da API falha, ainda conseguimos limpar a fila da maquininha)
     const allOrders = await store.listOrders()
     let ordersCleaned = 0
     for (const order of allOrders) {
       if (order.paymentIntentId) {
         try {
+          await cancelPointIntent(order.paymentIntentId)
           await store.attachPaymentIntent(order.id, null)
           ordersCleaned++
         } catch (err) {
@@ -594,8 +593,7 @@ app.post('/api/payments/mercadopago/pos/force-reset', async (_req, res) => {
       console.warn('[force-reset] falha ao limpar QR:', err?.message)
     }
 
-    // 2. Nullifica TODOS os intents no banco (garantia de atomicidade)
-    const db = require('pg').Pool ? null : require('pg').Client // fallback
+    // 2. Nullifica TODOS os intents no banco
     const allOrders = await store.listOrders()
     let ordersCleaned = 0
     const failedOrders = []
@@ -783,21 +781,25 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
             console.warn(`[pos/intent] não conseguiu listar intents da API:`, e?.message)
           }
 
-          // 2. Remove intents do banco
+          // 2. Cancela intents conhecidos pelo banco e remove vínculo
           try {
             const allOrders = await store.listOrders('aguardando pagamento')
+            let cancelledFromDb = 0
             for (const o of allOrders) {
               if (o.paymentIntentId) {
+                try {
+                  await cancelPointIntent(o.paymentIntentId)
+                  cancelledFromDb++
+                } catch (cancelErr) {
+                  console.warn(`[pos/intent] falha ao cancelar intent ${o.paymentIntentId} no device:`, cancelErr?.message)
+                }
                 await store.attachPaymentIntent(o.id, null)
               }
             }
-            console.log(`[pos/intent] intents removidos do banco`)
+            console.log(`[pos/intent] intents removidos do banco (${cancelledFromDb} cancelados no device via fallback)`)
           } catch (e) {
             console.warn(`[pos/intent] erro ao atualizar banco:`, e?.message)
           }
-
-          // 3. Limpa QR order
-          await clearPosOrder()
 
           // Delay antes da próxima tentativa (exponencial: 500ms, 1s, 2s)
           const delayMs = INITIAL_DELAY * Math.pow(2, attempt - 1)
