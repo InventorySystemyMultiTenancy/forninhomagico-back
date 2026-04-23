@@ -432,6 +432,47 @@ app.get('/api/financials', async (_req, res) => {
   }
 })
 
+// Endpoint de diagnóstico: consulta status completo de um intent pelo ID
+app.get('/api/payment-intent/diagnose/:intentId', async (req, res) => {
+  const { intentId } = req.params
+  const { pointDeviceId } = config.mercadoPago
+
+  if (!intentId) {
+    return res.status(400).json({ error: 'intentId é obrigatório' })
+  }
+
+  try {
+    const intent = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
+    const payment = intent.payment ?? intent.transactions?.payments?.[0]
+
+    return res.json({
+      intentId,
+      intent: {
+        id: intent.id,
+        state: intent.state,
+        status: intent.status,
+        created_at: intent.created_at,
+        updated_at: intent.updated_at,
+        additional_info: intent.additional_info,
+        external_reference: intent.external_reference,
+      },
+      payment: payment ? {
+        id: payment.id,
+        status: payment.status,
+        amount: payment.amount,
+        created_at: payment.created_at,
+      } : null,
+      resolvedStatus: payment?.status ?? intent.state,
+      shouldMarkAsApproved: (payment?.status ?? intent.state) === 'FINISHED' || payment?.status === 'approved',
+    })
+  } catch (err) {
+    return res.status(err.status || 500).json({
+      error: err.message,
+      payload: err.payload,
+    })
+  }
+})
+
 app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
   const { pointDeviceId } = config.mercadoPago
   if (!pointDeviceId) {
@@ -716,7 +757,11 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
       const intent = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
       const payment = (intent.payment ?? intent.transactions?.payments?.[0])
       const mpPaymentId = payment?.id ? String(payment.id) : null
-      const status = payment?.status ?? intent.state
+      const intentState = intent.state
+      const paymentStatus = payment?.status
+      const resolvedStatus = paymentStatus ?? intentState
+
+      console.log(`[webhook] payment_intent ${intentId}: state=${intentState}, payment.status=${paymentStatus}, resolved=${resolvedStatus}`)
 
       const resolvedOrderId = Number(intent.additional_info?.external_reference ?? intent.external_reference)
       let order = null
@@ -732,13 +777,24 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
         return res.status(200).json({ received: true })
       }
 
-      const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, status === 'FINISHED' ? 'approved' : status)
-      if (status === 'FINISHED' && mpPaymentId) {
+      console.log(`[webhook] payment_intent: orderId=${order.id}, resolvedStatus=${resolvedStatus}`)
+
+      // Converte status para format interno (aceita FINISHED, approved, ou payment.status)
+      let internalStatus = resolvedStatus
+      if (resolvedStatus === 'FINISHED' || resolvedStatus === 'approved') {
+        internalStatus = 'approved'
+      }
+
+      const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, internalStatus)
+      if ((resolvedStatus === 'FINISHED' || resolvedStatus === 'approved') && mpPaymentId) {
         await store.createPayment({
           orderId: updated.id, provider: 'mercadopago', status: 'approved',
           providerRef: mpPaymentId, receiptCode: updated.code,
         })
-        console.log(`[webhook] Point: pedido ${order.id} aprovado, code=${updated.code}`)
+        console.log(`[webhook] Point: pedido ${order.id} aprovado (${resolvedStatus}), code=${updated.code}`)
+        await clearPosOrder()
+      } else {
+        console.log(`[webhook] Point: pedido ${order.id} processado mas não aprovado ainda (${resolvedStatus})`)
       }
       return res.json({ received: true })
     } catch (err) {
@@ -754,25 +810,42 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
     try {
       const moId = resource.split('/').pop()
       const mo = await mpRequest(`/merchant_orders/${moId}`)
+      
+      console.log(`[webhook] merchant_order ${moId}: payments count=${mo.payments?.length || 0}`)
       const approvedPayment = (mo.payments || []).find(p => p.status === 'approved')
+      
       if (!approvedPayment) {
-        console.log(`[webhook] merchant_order ${moId} sem pagamento aprovado ainda`)
+        const statuses = (mo.payments || []).map(p => p.status).join(', ')
+        console.log(`[webhook] QR: merchant_order ${moId} sem pagamento aprovado (statuses: ${statuses})`)
         return res.status(200).json({ received: true })
       }
+      
       const orderId = Number(mo.external_reference)
       const mpPaymentId = String(approvedPayment.id)
-      if (Number.isNaN(orderId)) return res.status(200).json({ received: true })
-      const order = await store.getOrder(orderId)
-      if (!order) return res.status(200).json({ received: true })
-      if (order.status === 'em montagem' || order.status === 'pronto') {
+      
+      if (Number.isNaN(orderId)) {
+        console.warn(`[webhook] merchant_order ${moId}: external_reference inválido (${mo.external_reference})`)
         return res.status(200).json({ received: true })
       }
+      
+      const order = await store.getOrder(orderId)
+      if (!order) {
+        console.warn(`[webhook] merchant_order ${moId}: pedido ${orderId} não encontrado`)
+        return res.status(200).json({ received: true })
+      }
+      
+      if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado') {
+        console.log(`[webhook] QR: pedido ${orderId} já está em ${order.status}, ignorando`)
+        return res.status(200).json({ received: true })
+      }
+      
       const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, 'approved')
       await store.createPayment({
         orderId: updated.id, provider: 'mercadopago', status: 'approved',
         providerRef: mpPaymentId, receiptCode: updated.code,
       })
       console.log(`[webhook] QR: pedido ${orderId} aprovado, code=${updated.code}`)
+      await clearPosOrder()
       return res.json({ received: true })
     } catch (err) {
       console.error('[webhook] merchant_order erro:', err)
