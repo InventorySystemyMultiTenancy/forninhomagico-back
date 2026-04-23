@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS flavors (
   id SERIAL PRIMARY KEY,
   name TEXT NOT NULL,
+  image_url TEXT,
   price_cents INTEGER NOT NULL CHECK (price_cents >= 0),
   slices_total INTEGER NOT NULL CHECK (slices_total >= 0),
   slices_available INTEGER NOT NULL CHECK (slices_available >= 0),

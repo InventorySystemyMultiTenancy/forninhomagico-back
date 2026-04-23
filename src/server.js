@@ -16,6 +16,7 @@ app.use((req, _res, next) => {
 
 const flavorSchema = z.object({
   name: z.string().min(2),
+  imageUrl: z.string().url().optional().nullable(),
   priceCents: z.number().int().positive(),
   slicesTotal: z.number().int().nonnegative(),
   slicesAvailable: z.number().int().nonnegative(),
@@ -73,6 +74,14 @@ async function mpRequest(path, options = {}) {
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
+})
+
+app.get('/api/stats', async (_req, res) => {
+  try {
+    res.json(await store.getStats())
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
 })
 
 app.get('/api/flavors', async (_req, res) => {

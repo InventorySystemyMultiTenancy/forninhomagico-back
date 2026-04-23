@@ -4,7 +4,7 @@ const db = require('./db')
 
 async function listFlavors() {
   const { rows } = await db.query(
-    `SELECT id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+    `SELECT id, name, image_url AS "imageUrl", price_cents AS "priceCents", slices_total AS "slicesTotal",
             slices_available AS "slicesAvailable", is_active AS active
      FROM flavors ORDER BY id`,
   )
@@ -13,11 +13,11 @@ async function listFlavors() {
 
 async function createFlavor(payload) {
   const { rows } = await db.query(
-    `INSERT INTO flavors (name, price_cents, slices_total, slices_available, is_active)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+    `INSERT INTO flavors (name, image_url, price_cents, slices_total, slices_available, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING id, name, image_url AS "imageUrl", price_cents AS "priceCents", slices_total AS "slicesTotal",
                slices_available AS "slicesAvailable", is_active AS active`,
-    [payload.name, payload.priceCents, payload.slicesTotal, payload.slicesAvailable, payload.active ?? true],
+    [payload.name, payload.imageUrl || null, payload.priceCents, payload.slicesTotal, payload.slicesAvailable, payload.active ?? true],
   )
   return rows[0]
 }
@@ -25,6 +25,7 @@ async function createFlavor(payload) {
 async function updateFlavor(id, payload) {
   const map = {
     name: 'name',
+    imageUrl: 'image_url',
     priceCents: 'price_cents',
     slicesTotal: 'slices_total',
     slicesAvailable: 'slices_available',
@@ -45,7 +46,7 @@ async function updateFlavor(id, payload) {
   const { rows } = await db.query(
     `UPDATE flavors SET ${setClauses.join(', ')}, updated_at = NOW()
      WHERE id = $${i}
-     RETURNING id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+     RETURNING id, name, image_url AS "imageUrl", price_cents AS "priceCents", slices_total AS "slicesTotal",
                slices_available AS "slicesAvailable", is_active AS active`,
     values,
   )
@@ -59,7 +60,7 @@ async function addSlices(id, amount) {
          slices_total = slices_total + $2,
          updated_at = NOW()
      WHERE id = $1
-     RETURNING id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+     RETURNING id, name, image_url AS "imageUrl", price_cents AS "priceCents", slices_total AS "slicesTotal",
                slices_available AS "slicesAvailable", is_active AS active`,
     [id, amount],
   )
@@ -295,6 +296,23 @@ async function createPayment(payload) {
   return rows[0]
 }
 
+// ─── Stats ────────────────────────────────────────────────────────────────────
+
+async function getStats() {
+  const NON_CANCELLED = `status != 'cancelado'`
+  const PAID = `status IN ('em montagem', 'pronto', 'retirado', 'entregue')`
+  const { rows: t } = await db.query(`SELECT COUNT(*) AS total FROM orders WHERE ${NON_CANCELLED}`)
+  const { rows: p } = await db.query(`SELECT COUNT(*) AS paid FROM orders WHERE ${PAID}`)
+  const { rows: pend } = await db.query(`SELECT COUNT(*) AS pending FROM orders WHERE status = 'aguardando pagamento'`)
+  const { rows: c } = await db.query(`SELECT COUNT(*) AS cancelled FROM orders WHERE status = 'cancelado'`)
+  return {
+    totalOrders: Number(t[0].total),
+    paidOrders: Number(p[0].paid),
+    pendingOrders: Number(pend[0].pending),
+    cancelledOrders: Number(c[0].cancelled),
+  }
+}
+
 // ─── Financials ───────────────────────────────────────────────────────────────
 
 async function getFinancials() {
@@ -333,5 +351,6 @@ module.exports = {
   updateOrderFromPayment,
   cancelOrder,
   createPayment,
+  getStats,
   getFinancials,
 }
