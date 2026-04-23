@@ -8,6 +8,7 @@ const config = {
   mercadoPago: {
     accessToken: process.env.MERCADOPAGO_ACCESS_TOKEN || '',
     publicKey: process.env.MERCADOPAGO_PUBLIC_KEY || '',
+    pointDeviceId: process.env.MERCADOPAGO_POINT_DEVICE_ID || '',
     collectorId: process.env.MERCADOPAGO_COLLECTOR_ID || '',
     qrStoreId: process.env.MERCADOPAGO_QR_STORE_ID || '',
     qrExternalPosId: process.env.MERCADOPAGO_QR_EXTERNAL_POS_ID || '',
