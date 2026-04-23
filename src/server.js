@@ -1010,18 +1010,22 @@ async function processMercadoPagoNotification(source, sourceTag) {
 }
 
 // Endpoint principal de IPN (responde imediatamente e processa em background)
-app.post('/api/notifications/mercadopago', (req, res) => {
-  console.log('[ipn] recebido:', JSON.stringify({ query: req.query, body: req.body }))
+function handleMercadoPagoIpn(req, res, sourceTag) {
+  console.log(`[${sourceTag}] recebido:`, JSON.stringify({ method: req.method, query: req.query, body: req.body }))
   res.status(200).send('OK')
 
   setImmediate(async () => {
     try {
-      await processMercadoPagoNotification({ query: req.query, body: req.body }, 'ipn')
+      await processMercadoPagoNotification({ query: req.query, body: req.body }, sourceTag)
     } catch (err) {
-      console.error('[ipn] erro no processamento:', err)
+      console.error(`[${sourceTag}] erro no processamento:`, err)
     }
   })
-})
+}
+
+app.post('/api/notifications/mercadopago', (req, res) => handleMercadoPagoIpn(req, res, 'ipn'))
+// O botão "Experimentar" do Mercado Pago pode enviar GET com query params.
+app.get('/api/notifications/mercadopago', (req, res) => handleMercadoPagoIpn(req, res, 'ipn-get'))
 
 // Mantém compatibilidade com webhook antigo, mas no mesmo pipeline do IPN
 app.post('/api/payments/mercadopago/pos/webhook', (req, res) => {
