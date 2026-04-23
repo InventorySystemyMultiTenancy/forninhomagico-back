@@ -1,10 +1,40 @@
 const express = require('express')
 const cors = require('cors')
+const multer = require('multer')
+const { v2: cloudinary } = require('cloudinary')
 const { z } = require('zod')
 const { config } = require('./config')
 const store = require('./store')
 
 const app = express()
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+})
+
+if (config.cloudinary.cloudName && config.cloudinary.apiKey && config.cloudinary.apiSecret) {
+  cloudinary.config({
+    cloud_name: config.cloudinary.cloudName,
+    api_key: config.cloudinary.apiKey,
+    api_secret: config.cloudinary.apiSecret,
+  })
+}
+
+function uploadToCloudinary(buffer) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: config.cloudinary.folder,
+        resource_type: 'image',
+      },
+      (error, result) => {
+        if (error) return reject(error)
+        return resolve(result)
+      },
+    )
+    stream.end(buffer)
+  })
+}
 
 app.use(cors({ origin: config.corsOrigin }))
 app.use(express.json())
@@ -74,6 +104,28 @@ async function mpRequest(path, options = {}) {
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
+})
+
+app.post('/api/upload', upload.single('image'), async (req, res) => {
+  if (!config.cloudinary.cloudName || !config.cloudinary.apiKey || !config.cloudinary.apiSecret) {
+    return res.status(500).json({ error: 'Cloudinary not configured' })
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'Arquivo obrigatório no campo image' })
+  }
+
+  if (!req.file.mimetype || !req.file.mimetype.startsWith('image/')) {
+    return res.status(400).json({ error: 'Arquivo deve ser uma imagem' })
+  }
+
+  try {
+    const result = await uploadToCloudinary(req.file.buffer)
+    return res.status(201).json({ url: result.secure_url })
+  } catch (err) {
+    console.error('[POST /api/upload] erro:', err)
+    return res.status(500).json({ error: 'Falha no upload da imagem' })
+  }
 })
 
 app.get('/api/stats', async (_req, res) => {
