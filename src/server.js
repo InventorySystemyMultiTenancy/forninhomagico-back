@@ -426,6 +426,62 @@ app.get('/api/financials', async (_req, res) => {
   }
 })
 
+app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
+  const { pointDeviceId } = config.mercadoPago
+  if (!pointDeviceId) {
+    return res.status(503).json({
+      error: 'Maquininha não configurada',
+    })
+  }
+
+  try {
+    console.log('[clear-queue] iniciando limpeza forçada da fila...')
+
+    let intentsDeleted = 0
+    try {
+      const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
+      const intents = Array.isArray(response) ? response : (Array.isArray(response?.results) ? response.results : [])
+
+      for (const intent of intents) {
+        if (intent?.id) {
+          await cancelPointIntent(String(intent.id))
+          intentsDeleted++
+        }
+      }
+    } catch (err) {
+      console.warn('[clear-queue] não conseguiu listar intents da API, continuando com banco...', err?.payload || err?.message)
+    }
+
+    // Limpa QR order também
+    await clearPosOrder()
+
+    // Limpa TODOS os paymentIntentId do banco
+    const allOrders = await store.listOrders()
+    let ordersCleaned = 0
+    for (const order of allOrders) {
+      if (order.paymentIntentId) {
+        try {
+          await store.attachPaymentIntent(order.id, null)
+          ordersCleaned++
+        } catch (err) {
+          console.warn(`[clear-queue] falha ao limpar intent do pedido ${order.id}:`, err?.message)
+        }
+      }
+    }
+
+    console.log(`[clear-queue] concluído: ${intentsDeleted} intents deletados na maquininha, ${ordersCleaned} pedidos limpos no banco`)
+    return res.json({
+      success: true,
+      intentsDeleted,
+      ordersCleaned,
+      message: 'Fila da maquininha limpa com sucesso',
+    })
+  } catch (err) {
+    console.error('[clear-queue] erro:', err)
+    return res.status(500).json({ error: err.message || 'Falha ao limpar fila' })
+  }
+})
+
 app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
   const parsed = paymentIntentSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
