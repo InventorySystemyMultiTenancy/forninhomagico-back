@@ -380,46 +380,6 @@ async function cancelPointIntent(intentId) {
   }
 }
 
-async function clearQueuedPointIntentsFromPendingOrders(currentOrderId) {
-  const pendingOrders = await store.listOrders('aguardando pagamento')
-  const intentsToCancel = pendingOrders
-    .filter((order) => order.id !== currentOrderId && order.paymentIntentId)
-    .map((order) => String(order.paymentIntentId))
-
-  for (const intentId of intentsToCancel) {
-    await cancelPointIntent(intentId)
-  }
-
-  return intentsToCancel.length
-}
-
-function normalizeIntentsList(payload) {
-  if (Array.isArray(payload)) return payload
-  if (Array.isArray(payload?.results)) return payload.results
-  if (Array.isArray(payload?.payment_intents)) return payload.payment_intents
-  return []
-}
-
-function resolveOrderIdFromIntent(intent) {
-  const fromRef = Number(intent?.additional_info?.external_reference ?? intent?.external_reference)
-  if (!Number.isNaN(fromRef)) return fromRef
-  const description = String(intent?.description || '')
-  const match = description.match(/Pedido\s*#(\d+)/i)
-  if (!match) return NaN
-  const parsed = Number(match[1])
-  return Number.isNaN(parsed) ? NaN : parsed
-}
-
-async function listDevicePaymentIntents(deviceId) {
-  try {
-    const payload = await mpRequest(`/point/integration-api/devices/${deviceId}/payment-intents`)
-    return normalizeIntentsList(payload)
-  } catch (err) {
-    console.warn('[pos] falha ao listar payment-intents do device:', err?.payload || err?.message)
-    return []
-  }
-}
-
 function isQueuedIntentConflict(err) {
   return err?.status === 409 && String(err?.payload?.error || '') === '2205'
 }
@@ -510,41 +470,25 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       )
     }
 
-    // Prioriza o pedido atual limpando intents pendentes de outros pedidos na base
-    const cleared = await clearQueuedPointIntentsFromPendingOrders(order.id)
-    if (cleared > 0) {
-      console.log(`[pos/intent] ${cleared} intent(s) pendente(s) cancelado(s) antes de criar novo para pedido ${order.id}`)
-    }
-
     let intent
     try {
       intent = await createIntent()
     } catch (err) {
       if (!isQueuedIntentConflict(err)) throw err
 
-      const intents = await listDevicePaymentIntents(pointDeviceId)
-      const sameOrderIntent = intents.find((it) => resolveOrderIdFromIntent(it) === order.id)
-      if (sameOrderIntent?.id) {
-        await store.attachPaymentIntent(order.id, String(sameOrderIntent.id))
-        console.log(`[pos/intent] reaproveitado intent ${sameOrderIntent.id} em fila para pedido ${order.id}`)
-        return res.json({
-          success: true,
-          reusedQueuedIntent: true,
-          intentId: String(sameOrderIntent.id),
-          orderId: order.id,
-          totalCents: order.totalCents,
-        })
-      }
-
-      // Se não achar intent do mesmo pedido via API, força limpeza pela base e tenta recriar 1x
-      await clearQueuedPointIntentsFromPendingOrders(order.id)
-
-      // Compatibilidade: caso listagem da API funcione, também cancela os retornados
-      for (const pendingIntent of intents) {
-        if (pendingIntent?.id) {
-          await cancelPointIntent(String(pendingIntent.id))
+      // 409 significa fila travada: força limpeza TOTAL de intents no banco e tenta recriar UMA VEZ
+      console.log(`[pos/intent] 409 detectado, limpando TODOS os intents pendentes do banco...`)
+      const allOrders = await store.listOrders('aguardando pagamento')
+      let totalCancelled = 0
+      for (const o of allOrders) {
+        if (o.paymentIntentId) {
+          await cancelPointIntent(o.paymentIntentId)
+          totalCancelled++
         }
       }
+      console.log(`[pos/intent] ${totalCancelled} intent(s) cancelado(s) da base, tentando criar novamente...`)
+
+      // Tenta criar uma única vez após limpeza total
       intent = await createIntent()
     }
 
