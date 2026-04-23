@@ -349,6 +349,37 @@ async function cancelPointIntent(intentId) {
   }
 }
 
+function normalizeIntentsList(payload) {
+  if (Array.isArray(payload)) return payload
+  if (Array.isArray(payload?.results)) return payload.results
+  if (Array.isArray(payload?.payment_intents)) return payload.payment_intents
+  return []
+}
+
+function resolveOrderIdFromIntent(intent) {
+  const fromRef = Number(intent?.additional_info?.external_reference ?? intent?.external_reference)
+  if (!Number.isNaN(fromRef)) return fromRef
+  const description = String(intent?.description || '')
+  const match = description.match(/Pedido\s*#(\d+)/i)
+  if (!match) return NaN
+  const parsed = Number(match[1])
+  return Number.isNaN(parsed) ? NaN : parsed
+}
+
+async function listDevicePaymentIntents(deviceId) {
+  try {
+    const payload = await mpRequest(`/point/integration-api/devices/${deviceId}/payment-intents`)
+    return normalizeIntentsList(payload)
+  } catch (err) {
+    console.warn('[pos] falha ao listar payment-intents do device:', err?.payload || err?.message)
+    return []
+  }
+}
+
+function isQueuedIntentConflict(err) {
+  return err?.status === 409 && String(err?.payload?.error || '') === '2205'
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/orders/:id', async (req, res) => {
@@ -428,11 +459,41 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       body.notification_url = `${config.serverUrl}/api/payments/mercadopago/pos/webhook`
     }
 
-    // URL correta: /point/integration-api/ (sem /v1/)
-    const intent = await mpRequest(
-      `/point/integration-api/devices/${pointDeviceId}/payment-intents`,
-      { method: 'POST', body: JSON.stringify(body) },
-    )
+    async function createIntent() {
+      return mpRequest(
+        `/point/integration-api/devices/${pointDeviceId}/payment-intents`,
+        { method: 'POST', body: JSON.stringify(body) },
+      )
+    }
+
+    let intent
+    try {
+      intent = await createIntent()
+    } catch (err) {
+      if (!isQueuedIntentConflict(err)) throw err
+
+      const intents = await listDevicePaymentIntents(pointDeviceId)
+      const sameOrderIntent = intents.find((it) => resolveOrderIdFromIntent(it) === order.id)
+      if (sameOrderIntent?.id) {
+        await store.attachPaymentIntent(order.id, String(sameOrderIntent.id))
+        console.log(`[pos/intent] reaproveitado intent ${sameOrderIntent.id} em fila para pedido ${order.id}`)
+        return res.json({
+          success: true,
+          reusedQueuedIntent: true,
+          intentId: String(sameOrderIntent.id),
+          orderId: order.id,
+          totalCents: order.totalCents,
+        })
+      }
+
+      // Se não achar intent do mesmo pedido, tenta limpar fila e recriar 1x
+      for (const pendingIntent of intents) {
+        if (pendingIntent?.id) {
+          await cancelPointIntent(String(pendingIntent.id))
+        }
+      }
+      intent = await createIntent()
+    }
 
     await store.attachPaymentIntent(order.id, intent.id)
 
