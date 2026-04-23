@@ -38,6 +38,7 @@ function uploadToCloudinary(buffer) {
 
 app.use(cors({ origin: config.corsOrigin }))
 app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`, req.body)
@@ -740,7 +741,8 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     }
 
     if (config.serverUrl) {
-      body.notification_url = `${config.serverUrl}/api/payments/mercadopago/pos/webhook`
+      // Usa IPN como canal principal de confirmação
+      body.notification_url = `${config.serverUrl}/api/notifications/mercadopago`
     }
 
     async function createIntent() {
@@ -850,11 +852,23 @@ app.patch('/api/orders/:id/confirm', async (req, res) => {
 
 // Rota alternativa usada pelo Mercado Pago Point (notification_url configurada no painel)
 app.post('/api/notifications/mercadopago', async (req, res) => {
-  console.log('[notifications] recebido:', JSON.stringify(req.body))
+  console.log('[notifications] recebido:', JSON.stringify({ query: req.query, body: req.body }))
 
-  const topic = req.body?.type || req.body?.topic
-  // resource pode ser ID direto ou URL como "https://.../payments/123"
-  const rawResource = req.body?.resource || req.body?.data?.id
+  // IPN pode chegar por query string (topic/id) ou por body (type/data.id/resource)
+  const topic =
+    req.query?.topic ||
+    req.query?.type ||
+    req.body?.type ||
+    req.body?.topic
+
+  // resource pode vir como URL ou ID direto, em query/body
+  const rawResource =
+    req.query?.resource ||
+    req.query?.id ||
+    req.body?.resource ||
+    req.body?.id ||
+    req.body?.data?.id
+
   const paymentId = rawResource ? String(rawResource).split('/').pop() : null
 
   if (topic === 'payment' && paymentId) {
