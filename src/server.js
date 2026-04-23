@@ -37,6 +37,7 @@ const orderSchema = z.object({
   flavorId: z.number().int(),
   qty: z.number().int().positive(),
   paymentMethod: z.enum(['point', 'pix', 'dinheiro']),
+  customerName: z.string().min(1).max(60).optional(),
 })
 
 const paymentIntentSchema = z.object({
@@ -183,6 +184,18 @@ app.post('/api/orders', async (req, res) => {
     const order = await store.createOrder(parsed.data)
     if (order.error) return res.status(400).json({ error: order.error })
     return res.status(201).json(order)
+  } catch {
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.patch('/api/orders/:id/pickup', async (req, res) => {
+  try {
+    const order = await store.getOrder(Number(req.params.id))
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    if (order.status !== 'pronto') return res.status(409).json({ error: 'Pedido não está pronto para retirada' })
+    const updated = await store.updateOrderStatus(Number(req.params.id), 'retirado')
+    return res.json(updated)
   } catch {
     return res.status(500).json({ error: 'Internal server error' })
   }

@@ -97,7 +97,7 @@ async function deleteCost(id) {
 // ─── Orders ───────────────────────────────────────────────────────────────────
 
 const ORDER_SELECT = `
-  SELECT o.id, o.order_code, o.payment_method, o.status, o.total_cents, o.created_at, o.paid_at,
+  SELECT o.id, o.order_code, o.customer_name, o.payment_method, o.status, o.total_cents, o.created_at, o.paid_at,
          o.payment_intent_id, oi.flavor_id, f.name AS flavor_name, oi.qty
   FROM orders o
   LEFT JOIN order_items oi ON oi.order_id = o.id
@@ -107,6 +107,7 @@ function rowToOrder(row) {
   return {
     id: row.id,
     code: row.order_code,
+    customerName: row.customer_name || null,
     paymentMethod: row.payment_method || 'point',
     flavorId: row.flavor_id || null,
     flavorName: row.flavor_name || null,
@@ -171,10 +172,10 @@ async function createOrder(payload) {
 
     const totalCents = payload.qty * flavor.price_cents
     const { rows: oRows } = await client.query(
-      `INSERT INTO orders (status, total_cents, payment_method)
-       VALUES ($1, $2, $3)
-       RETURNING id, order_code, payment_method, status, total_cents, created_at, paid_at, payment_intent_id`,
-      ['aguardando pagamento', totalCents, payload.paymentMethod || 'point'],
+      `INSERT INTO orders (status, total_cents, payment_method, customer_name)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, order_code, customer_name, payment_method, status, total_cents, created_at, paid_at, payment_intent_id`,
+      ['aguardando pagamento', totalCents, payload.paymentMethod || 'point', payload.customerName || null],
     )
     const order = oRows[0]
 
@@ -187,6 +188,7 @@ async function createOrder(payload) {
     return {
       id: order.id,
       code: order.order_code,
+      customerName: order.customer_name || null,
       paymentMethod: order.payment_method,
       flavorId: flavor.id,
       flavorName: flavor.name,
@@ -296,7 +298,7 @@ async function createPayment(payload) {
 // ─── Financials ───────────────────────────────────────────────────────────────
 
 async function getFinancials() {
-  const PAID_STATUSES = `('em montagem', 'pronto', 'entregue')`
+  const PAID_STATUSES = `('em montagem', 'pronto', 'entregue', 'retirado')`
   const { rows: g } = await db.query(
     `SELECT COALESCE(SUM(total_cents), 0) AS gross FROM orders WHERE status IN ${PAID_STATUSES}`,
   )

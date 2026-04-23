@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS costs (
 CREATE TABLE IF NOT EXISTS orders (
   id SERIAL PRIMARY KEY,
   order_code CHAR(3),
+  customer_name TEXT,
   payment_method TEXT NOT NULL DEFAULT 'point',
   status TEXT NOT NULL,
   total_cents INTEGER NOT NULL CHECK (total_cents >= 0),
