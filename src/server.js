@@ -102,6 +102,27 @@ async function mpRequest(path, options = {}) {
   return data
 }
 
+function resolveOrderIdFromPayment(payment) {
+  const candidates = [
+    payment?.external_reference,
+    payment?.metadata?.external_reference,
+    payment?.additional_info?.external_reference,
+  ]
+  for (const ref of candidates) {
+    const value = Number(ref)
+    if (!Number.isNaN(value)) return value
+  }
+
+  const description = String(payment?.description || '')
+  const match = description.match(/Pedido\s*#(\d+)/i)
+  if (match) {
+    const value = Number(match[1])
+    if (!Number.isNaN(value)) return value
+  }
+
+  return NaN
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
 })
@@ -373,7 +394,6 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     const body = {
       amount: order.totalCents,
       description: `Pedido #${order.id} - Forninho Magico`,
-      external_reference: String(order.id),
       additional_info: {
         external_reference: String(order.id),
         print_on_terminal: true,
@@ -438,14 +458,14 @@ app.post('/api/notifications/mercadopago', async (req, res) => {
   if (topic === 'payment' && paymentId) {
     try {
       const payment = await mpRequest(`/v1/payments/${paymentId}`)
-      const orderId = Number(payment.external_reference)
+      const orderId = resolveOrderIdFromPayment(payment)
       const status = payment.status
       const mpPaymentId = String(payment.id)
 
       console.log(`[notifications] payment ${mpPaymentId} status=${status} orderId=${orderId}`)
 
       if (Number.isNaN(orderId)) {
-        console.warn('[notifications] external_reference inválido:', payment.external_reference)
+        console.warn('[notifications] não foi possível resolver orderId no payment:', payment.id)
         return res.status(200).json({ received: true })
       }
 
@@ -580,7 +600,7 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
     if (!paymentId) return res.status(200).json({ received: true })
     try {
       const payment = await mpRequest(`/v1/payments/${paymentId}`)
-      const orderId = Number(payment.external_reference)
+      const orderId = resolveOrderIdFromPayment(payment)
       if (Number.isNaN(orderId)) return res.status(200).json({ received: true })
       const order = await store.getOrder(orderId)
       if (!order) return res.status(200).json({ received: true })
