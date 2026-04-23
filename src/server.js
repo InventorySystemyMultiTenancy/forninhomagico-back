@@ -187,6 +187,38 @@ app.patch('/api/orders/:id/status', async (req, res) => {
   }
 })
 
+// ─── Helpers Mercado Pago ────────────────────────────────────────────────────
+
+async function clearPosOrder() {
+  const { collectorId, qrStoreId, qrExternalPosId } = config.mercadoPago
+  if (!collectorId || !qrStoreId || !qrExternalPosId) return
+  try {
+    await mpRequest(
+      `/instore/qr/seller/collectors/${collectorId}/stores/${qrStoreId}/pos/${qrExternalPosId}/orders`,
+      { method: 'DELETE' },
+    )
+    console.log('[pos] QR order limpo')
+  } catch (err) {
+    console.warn('[pos] falha ao limpar QR order:', err?.payload || err?.message)
+  }
+}
+
+async function cancelPointIntent(intentId) {
+  const { pointDeviceId } = config.mercadoPago
+  if (!pointDeviceId || !intentId) return
+  try {
+    await mpRequest(
+      `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intentId}`,
+      { method: 'DELETE' },
+    )
+    console.log(`[pos] intent ${intentId} cancelado na maquininha`)
+  } catch (err) {
+    console.warn('[pos] falha ao cancelar intent:', err?.payload || err?.message)
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.get('/api/orders/:id', async (req, res) => {
   const orderId = Number(req.params.id)
   if (Number.isNaN(orderId)) return res.status(400).json({ error: 'Invalid order id' })
@@ -204,6 +236,11 @@ app.delete('/api/orders/:id', async (req, res) => {
   const orderId = Number(req.params.id)
   if (Number.isNaN(orderId)) return res.status(400).json({ error: 'Invalid order id' })
   try {
+    const order = await store.getOrder(orderId)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    // Cancela intent na maquininha antes de cancelar o pedido
+    if (order.paymentIntentId) await cancelPointIntent(order.paymentIntentId)
+    await clearPosOrder()
     const result = await store.cancelOrder(orderId)
     if (!result) return res.status(404).json({ error: 'Order not found' })
     if (result.error) return res.status(400).json({ error: result.error })
@@ -238,6 +275,12 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found' })
     if (order.status !== 'aguardando pagamento') {
       return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
+    }
+
+    // Idempotência: se já existe intent ativo, retorna sem criar novo
+    if (order.paymentIntentId) {
+      console.log(`[pos/intent] intent ${order.paymentIntentId} já existe para pedido ${order.id}`)
+      return res.json({ success: true, intentId: order.paymentIntentId, orderId: order.id, totalCents: order.totalCents })
     }
 
     const body = {
@@ -333,6 +376,7 @@ app.post('/api/notifications/mercadopago', async (req, res) => {
           providerRef: mpPaymentId, receiptCode: updated.code,
         })
         console.log(`[notifications] pedido ${orderId} aprovado, code=${updated.code}`)
+        await clearPosOrder()
       }
       return res.json({ received: true })
     } catch (err) {
@@ -360,6 +404,7 @@ app.post('/api/notifications/mercadopago', async (req, res) => {
         providerRef: mpPaymentId, receiptCode: updated.code,
       })
       console.log(`[notifications] merchant_order: pedido ${orderId} aprovado, code=${updated.code}`)
+      await clearPosOrder()
       return res.json({ received: true })
     } catch (err) {
       console.error('[notifications] merchant_order erro:', err)
