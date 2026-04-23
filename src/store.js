@@ -1,159 +1,260 @@
-const { randomInt } = require('crypto')
+const db = require('./db')
 
-const store = {
-  flavors: [
-    {
-      id: 1,
-      name: 'Brigadeiro da Casa',
-      priceCents: 1200,
-      slicesTotal: 30,
-      slicesAvailable: 18,
-      active: true,
-    },
-    {
-      id: 2,
-      name: 'Doce de Leite Fino',
-      priceCents: 1100,
-      slicesTotal: 24,
-      slicesAvailable: 4,
-      active: true,
-    },
-  ],
-  costs: [
-    { id: 1, label: 'Leite condensado', amountCents: 28000, cadence: 'monthly' },
-    { id: 2, label: 'Gas e energia', amountCents: 19000, cadence: 'monthly' },
-  ],
-  orders: [],
-  payments: [],
+// ─── Flavors ──────────────────────────────────────────────────────────────────
+
+async function listFlavors() {
+  const { rows } = await db.query(
+    `SELECT id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+            slices_available AS "slicesAvailable", is_active AS active
+     FROM flavors ORDER BY id`,
+  )
+  return rows
 }
 
-const counters = {
-  flavorId: store.flavors.length + 1,
-  costId: store.costs.length + 1,
-  orderId: 1000,
-  paymentId: 1,
+async function createFlavor(payload) {
+  const { rows } = await db.query(
+    `INSERT INTO flavors (name, price_cents, slices_total, slices_available, is_active)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+               slices_available AS "slicesAvailable", is_active AS active`,
+    [payload.name, payload.priceCents, payload.slicesTotal, payload.slicesAvailable, payload.active ?? true],
+  )
+  return rows[0]
 }
 
-function generateOrderCode() {
-  return String(randomInt(0, 1000)).padStart(3, '0')
-}
-
-function listFlavors() {
-  return store.flavors
-}
-
-function createFlavor(payload) {
-  const flavor = {
-    id: counters.flavorId++,
-    name: payload.name,
-    priceCents: payload.priceCents,
-    slicesTotal: payload.slicesTotal,
-    slicesAvailable: payload.slicesAvailable,
-    active: payload.active ?? true,
+async function updateFlavor(id, payload) {
+  const map = {
+    name: 'name',
+    priceCents: 'price_cents',
+    slicesTotal: 'slices_total',
+    slicesAvailable: 'slices_available',
+    active: 'is_active',
   }
-  store.flavors.push(flavor)
-  return flavor
-}
-
-function updateFlavor(id, payload) {
-  const flavor = store.flavors.find((item) => item.id === id)
-  if (!flavor) return null
-  Object.assign(flavor, payload)
-  return flavor
-}
-
-function addSlices(id, amount) {
-  const flavor = store.flavors.find((item) => item.id === id)
-  if (!flavor) return null
-  flavor.slicesTotal += amount
-  flavor.slicesAvailable += amount
-  return flavor
-}
-
-function listCosts() {
-  return store.costs
-}
-
-function createCost(payload) {
-  const cost = {
-    id: counters.costId++,
-    label: payload.label,
-    amountCents: payload.amountCents,
-    cadence: payload.cadence,
+  const setClauses = []
+  const values = []
+  let i = 1
+  for (const [key, val] of Object.entries(payload)) {
+    const col = map[key]
+    if (col) {
+      setClauses.push(`${col} = $${i++}`)
+      values.push(val)
+    }
   }
-  store.costs.push(cost)
-  return cost
+  if (setClauses.length === 0) return null
+  values.push(id)
+  const { rows } = await db.query(
+    `UPDATE flavors SET ${setClauses.join(', ')}, updated_at = NOW()
+     WHERE id = $${i}
+     RETURNING id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+               slices_available AS "slicesAvailable", is_active AS active`,
+    values,
+  )
+  return rows[0] || null
 }
 
-function listOrders(status) {
-  if (!status) return store.orders
-  return store.orders.filter((order) => order.status === status)
+async function addSlices(id, amount) {
+  const { rows } = await db.query(
+    `UPDATE flavors
+     SET slices_available = slices_available + $2,
+         slices_total = slices_total + $2,
+         updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, name, price_cents AS "priceCents", slices_total AS "slicesTotal",
+               slices_available AS "slicesAvailable", is_active AS active`,
+    [id, amount],
+  )
+  return rows[0] || null
 }
 
-function createOrder(payload) {
-  const flavor = store.flavors.find((item) => item.id === payload.flavorId)
-  if (!flavor || !flavor.active) {
-    return { error: 'Flavor unavailable' }
+// ─── Costs ────────────────────────────────────────────────────────────────────
+
+async function listCosts() {
+  const { rows } = await db.query(
+    `SELECT id, label, amount_cents AS "amountCents", cadence
+     FROM costs WHERE is_active = true ORDER BY id`,
+  )
+  return rows
+}
+
+async function createCost(payload) {
+  const { rows } = await db.query(
+    `INSERT INTO costs (label, amount_cents, cadence)
+     VALUES ($1, $2, $3)
+     RETURNING id, label, amount_cents AS "amountCents", cadence`,
+    [payload.label, payload.amountCents, payload.cadence],
+  )
+  return rows[0]
+}
+
+// ─── Orders ───────────────────────────────────────────────────────────────────
+
+const ORDER_SELECT = `
+  SELECT o.id, o.order_code, o.status, o.total_cents, o.created_at, o.paid_at,
+         o.payment_intent_id, oi.flavor_id, f.name AS flavor_name, oi.qty
+  FROM orders o
+  LEFT JOIN order_items oi ON oi.order_id = o.id
+  LEFT JOIN flavors f ON f.id = oi.flavor_id`
+
+function rowToOrder(row) {
+  return {
+    id: row.id,
+    code: row.order_code,
+    flavorId: row.flavor_id || null,
+    flavorName: row.flavor_name || null,
+    qty: row.qty ? Number(row.qty) : null,
+    status: row.status,
+    totalCents: Number(row.total_cents),
+    createdAt: row.created_at,
+    paidAt: row.paid_at,
+    paymentIntentId: row.payment_intent_id || null,
   }
-  if (flavor.slicesAvailable < payload.qty) {
-    return { error: 'Insufficient slices' }
+}
+
+async function listOrders(status) {
+  const params = []
+  const where = status ? 'WHERE o.status = $1' : ''
+  if (status) params.push(status)
+  const { rows } = await db.query(
+    `${ORDER_SELECT} ${where} ORDER BY o.created_at DESC`,
+    params,
+  )
+  return rows.map(rowToOrder)
+}
+
+async function getOrder(orderId) {
+  const { rows } = await db.query(`${ORDER_SELECT} WHERE o.id = $1`, [orderId])
+  return rows[0] ? rowToOrder(rows[0]) : null
+}
+
+async function findOrderByPaymentIntentId(paymentIntentId) {
+  const { rows } = await db.query(
+    `${ORDER_SELECT} WHERE o.payment_intent_id = $1`,
+    [paymentIntentId],
+  )
+  return rows[0] ? rowToOrder(rows[0]) : null
+}
+
+async function createOrder(payload) {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+
+    const { rows: fRows } = await client.query(
+      `SELECT id, name, price_cents, slices_available, is_active
+       FROM flavors WHERE id = $1 FOR UPDATE`,
+      [payload.flavorId],
+    )
+    const flavor = fRows[0]
+
+    if (!flavor || !flavor.is_active) {
+      await client.query('ROLLBACK')
+      return { error: 'Flavor unavailable' }
+    }
+    if (flavor.slices_available < payload.qty) {
+      await client.query('ROLLBACK')
+      return { error: 'Insufficient slices' }
+    }
+
+    await client.query(
+      `UPDATE flavors SET slices_available = slices_available - $2, updated_at = NOW() WHERE id = $1`,
+      [flavor.id, payload.qty],
+    )
+
+    const totalCents = payload.qty * flavor.price_cents
+    const { rows: oRows } = await client.query(
+      `INSERT INTO orders (status, total_cents)
+       VALUES ($1, $2)
+       RETURNING id, order_code, status, total_cents, created_at, paid_at, payment_intent_id`,
+      ['aguardando pagamento', totalCents],
+    )
+    const order = oRows[0]
+
+    await client.query(
+      `INSERT INTO order_items (order_id, flavor_id, qty, price_cents) VALUES ($1, $2, $3, $4)`,
+      [order.id, flavor.id, payload.qty, flavor.price_cents],
+    )
+
+    await client.query('COMMIT')
+    return {
+      id: order.id,
+      code: order.order_code,
+      flavorId: flavor.id,
+      flavorName: flavor.name,
+      qty: payload.qty,
+      status: order.status,
+      totalCents: Number(order.total_cents),
+      createdAt: order.created_at,
+      paidAt: null,
+      paymentIntentId: null,
+    }
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
   }
-
-  flavor.slicesAvailable -= payload.qty
-
-  const totalCents = payload.qty * flavor.priceCents
-  const order = {
-    id: counters.orderId++,
-    code: generateOrderCode(),
-    flavorId: flavor.id,
-    flavorName: flavor.name,
-    qty: payload.qty,
-    status: 'aguardando pagamento',
-    totalCents,
-    createdAt: new Date().toISOString(),
-    paidAt: null,
-  }
-
-  store.orders.push(order)
-  return order
 }
 
-function markOrderPaid(orderId) {
-  const order = store.orders.find((item) => item.id === orderId)
-  if (!order) return null
-  order.status = 'em montagem'
-  order.paidAt = new Date().toISOString()
-  return order
+async function attachPaymentIntent(orderId, paymentIntentId) {
+  const { rowCount } = await db.query(
+    `UPDATE orders SET payment_intent_id = $2 WHERE id = $1`,
+    [orderId, paymentIntentId],
+  )
+  return rowCount > 0
 }
 
-function updateOrderStatus(orderId, status) {
-  const order = store.orders.find((item) => item.id === orderId)
-  if (!order) return null
-  order.status = status
-  return order
+async function markOrderPaid(orderId, paymentId) {
+  const code = paymentId ? String(paymentId).slice(-3) : null
+  await db.query(
+    `UPDATE orders SET status = 'em montagem', paid_at = NOW(), order_code = $2 WHERE id = $1`,
+    [orderId, code],
+  )
+  return getOrder(orderId)
 }
 
-function createPayment(payload) {
-  const payment = {
-    id: counters.paymentId++,
-    orderId: payload.orderId,
-    provider: payload.provider,
-    status: payload.status,
-    providerRef: payload.providerRef,
-    receiptCode: payload.receiptCode,
-    createdAt: new Date().toISOString(),
-  }
-  store.payments.push(payment)
-  return payment
+async function updateOrderStatus(orderId, status) {
+  const { rowCount } = await db.query(
+    `UPDATE orders SET status = $2 WHERE id = $1`,
+    [orderId, status],
+  )
+  if (!rowCount) return null
+  return getOrder(orderId)
 }
 
-function getFinancials() {
-  const gross = store.orders
-    .filter((order) => order.status !== 'aguardando pagamento')
-    .reduce((total, order) => total + order.totalCents, 0)
-  const costs = store.costs.reduce((total, cost) => total + cost.amountCents, 0)
-  const net = gross - costs
-  return { gross, costs, net }
+async function updateOrderFromPayment(orderId, paymentId, status) {
+  if (status === 'approved') return markOrderPaid(orderId, paymentId)
+  const newStatus =
+    status === 'rejected' ? 'pagamento recusado'
+    : status === 'cancelled' || status === 'canceled' ? 'cancelado'
+    : status
+  return updateOrderStatus(orderId, newStatus)
+}
+
+// ─── Payments ─────────────────────────────────────────────────────────────────
+
+async function createPayment(payload) {
+  const { rows } = await db.query(
+    `INSERT INTO payments (order_id, provider, status, provider_ref, receipt_code)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, order_id AS "orderId", provider, status,
+               provider_ref AS "providerRef", receipt_code AS "receiptCode", created_at AS "createdAt"`,
+    [payload.orderId, payload.provider, payload.status, payload.providerRef || null, payload.receiptCode || null],
+  )
+  return rows[0]
+}
+
+// ─── Financials ───────────────────────────────────────────────────────────────
+
+async function getFinancials() {
+  const { rows: g } = await db.query(
+    `SELECT COALESCE(SUM(total_cents), 0) AS gross FROM orders WHERE status != 'aguardando pagamento'`,
+  )
+  const { rows: c } = await db.query(
+    `SELECT COALESCE(SUM(amount_cents), 0) AS costs FROM costs WHERE is_active = true`,
+  )
+  const gross = Number(g[0].gross)
+  const costs = Number(c[0].costs)
+  return { gross, costs, net: gross - costs }
 }
 
 module.exports = {
@@ -164,9 +265,13 @@ module.exports = {
   listCosts,
   createCost,
   listOrders,
+  getOrder,
+  findOrderByPaymentIntentId,
   createOrder,
+  attachPaymentIntent,
   markOrderPaid,
   updateOrderStatus,
+  updateOrderFromPayment,
   createPayment,
   getFinancials,
 }

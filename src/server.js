@@ -9,6 +9,11 @@ const app = express()
 app.use(cors({ origin: config.corsOrigin }))
 app.use(express.json())
 
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`, req.body)
+  next()
+})
+
 const flavorSchema = z.object({
   name: z.string().min(2),
   priceCents: z.number().int().positive(),
@@ -33,134 +38,233 @@ const orderSchema = z.object({
   paymentMethod: z.string().min(2),
 })
 
-const paymentSchema = z.object({
+const paymentIntentSchema = z.object({
   orderId: z.number().int(),
-  status: z.enum(['pending', 'approved', 'rejected']),
-  providerRef: z.string().optional(),
 })
+
+async function mpRequest(path, options = {}) {
+  if (!config.mercadoPago.accessToken) {
+    throw new Error('Mercado Pago access token not configured')
+  }
+
+  const response = await fetch(`https://api.mercadopago.com${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${config.mercadoPago.accessToken}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  })
+
+  const text = await response.text()
+  const data = text ? JSON.parse(text) : null
+
+  if (!response.ok) {
+    const error = new Error('Mercado Pago request failed')
+    error.status = response.status
+    error.payload = data
+    throw error
+  }
+
+  return data
+}
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
 })
 
-app.get('/api/flavors', (_req, res) => {
-  res.json(store.listFlavors())
+app.get('/api/flavors', async (_req, res) => {
+  try {
+    res.json(await store.listFlavors())
+  } catch (err) {
+    console.error('[GET /api/flavors]', err)
+    res.status(500).json({ error: 'Internal server error' })
+  }
 })
 
-app.post('/api/flavors', (req, res) => {
+app.post('/api/flavors', async (req, res) => {
+  console.log('[POST /api/flavors] body recebido:', req.body)
   const parsed = flavorSchema.safeParse(req.body)
   if (!parsed.success) {
+    console.warn('[POST /api/flavors] validacao falhou:', parsed.error.flatten())
     return res.status(400).json({ error: parsed.error.flatten() })
   }
-  const flavor = store.createFlavor(parsed.data)
-  return res.status(201).json(flavor)
+  try {
+    const flavor = await store.createFlavor(parsed.data)
+    console.log('[POST /api/flavors] sabor criado:', flavor)
+    return res.status(201).json(flavor)
+  } catch (err) {
+    console.error('[POST /api/flavors] erro ao criar sabor:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
 })
 
-app.patch('/api/flavors/:id', (req, res) => {
-  const flavorId = Number(req.params.id)
-  const flavor = store.updateFlavor(flavorId, req.body)
-  if (!flavor) return res.status(404).json({ error: 'Flavor not found' })
-  return res.json(flavor)
+app.patch('/api/flavors/:id', async (req, res) => {
+  console.log(`[PATCH /api/flavors/${req.params.id}] body recebido:`, req.body)
+  try {
+    const flavor = await store.updateFlavor(Number(req.params.id), req.body)
+    if (!flavor) {
+      console.warn(`[PATCH /api/flavors/${req.params.id}] sabor nao encontrado`)
+      return res.status(404).json({ error: 'Flavor not found' })
+    }
+    return res.json(flavor)
+  } catch (err) {
+    console.error(`[PATCH /api/flavors/${req.params.id}] erro:`, err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
 })
 
-app.post('/api/flavors/:id/slices', (req, res) => {
+app.post('/api/flavors/:id/slices', async (req, res) => {
   const parsed = slicesSchema.safeParse(req.body)
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() })
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+  try {
+    const flavor = await store.addSlices(Number(req.params.id), parsed.data.amount)
+    if (!flavor) return res.status(404).json({ error: 'Flavor not found' })
+    return res.json(flavor)
+  } catch {
+    return res.status(500).json({ error: 'Internal server error' })
   }
-  const flavorId = Number(req.params.id)
-  const flavor = store.addSlices(flavorId, parsed.data.amount)
-  if (!flavor) return res.status(404).json({ error: 'Flavor not found' })
-  return res.json(flavor)
 })
 
-app.get('/api/costs', (_req, res) => {
-  res.json(store.listCosts())
+app.get('/api/costs', async (_req, res) => {
+  try {
+    res.json(await store.listCosts())
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
 })
 
-app.post('/api/costs', (req, res) => {
+app.post('/api/costs', async (req, res) => {
   const parsed = costSchema.safeParse(req.body)
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() })
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+  try {
+    const cost = await store.createCost(parsed.data)
+    return res.status(201).json(cost)
+  } catch {
+    return res.status(500).json({ error: 'Internal server error' })
   }
-  const cost = store.createCost(parsed.data)
-  return res.status(201).json(cost)
 })
 
-app.get('/api/orders', (req, res) => {
-  const status = req.query.status ? String(req.query.status) : null
-  res.json(store.listOrders(status))
+app.get('/api/orders', async (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : null
+    res.json(await store.listOrders(status))
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
 })
 
-app.post('/api/orders', (req, res) => {
+app.get('/api/orders/ready', async (_req, res) => {
+  try {
+    res.json(await store.listOrders('pronto'))
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.post('/api/orders', async (req, res) => {
   const parsed = orderSchema.safeParse(req.body)
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() })
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+  try {
+    const order = await store.createOrder(parsed.data)
+    if (order.error) return res.status(400).json({ error: order.error })
+    return res.status(201).json(order)
+  } catch {
+    return res.status(500).json({ error: 'Internal server error' })
   }
-  const order = store.createOrder(parsed.data)
-  if (order.error) {
-    return res.status(400).json({ error: order.error })
-  }
-  return res.status(201).json(order)
 })
 
-app.patch('/api/orders/:id/status', (req, res) => {
-  const orderId = Number(req.params.id)
+app.patch('/api/orders/:id/status', async (req, res) => {
   const status = req.body.status
-  if (!status) {
-    return res.status(400).json({ error: 'Status required' })
-  }
-  const order = store.updateOrderStatus(orderId, status)
-  if (!order) return res.status(404).json({ error: 'Order not found' })
-  return res.json(order)
-})
-
-app.get('/api/orders/ready', (_req, res) => {
-  res.json(store.listOrders('pronto'))
-})
-
-app.get('/api/financials', (_req, res) => {
-  res.json(store.getFinancials())
-})
-
-app.post('/api/payments/mercadopago/terminal/charge', (req, res) => {
-  const parsed = paymentSchema.safeParse(req.body)
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() })
-  }
-
-  const order = store.markOrderPaid(parsed.data.orderId)
-  if (!order) {
-    return res.status(404).json({ error: 'Order not found' })
-  }
-
-  const payment = store.createPayment({
-    orderId: order.id,
-    provider: 'mercadopago',
-    status: parsed.data.status,
-    providerRef: parsed.data.providerRef || 'mp-placeholder',
-    receiptCode: order.code,
-  })
-
-  res.json({
-    status: payment.status,
-    receiptCode: payment.receiptCode,
-    order,
-  })
-})
-
-app.post('/api/payments/mercadopago/webhook', (req, res) => {
-  const parsed = paymentSchema.safeParse(req.body)
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() })
-  }
-
-  if (parsed.data.status === 'approved') {
-    const order = store.markOrderPaid(parsed.data.orderId)
+  if (!status) return res.status(400).json({ error: 'Status required' })
+  try {
+    const order = await store.updateOrderStatus(Number(req.params.id), status)
     if (!order) return res.status(404).json({ error: 'Order not found' })
+    return res.json(order)
+  } catch {
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.get('/api/financials', async (_req, res) => {
+  try {
+    res.json(await store.getFinancials())
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
+  const parsed = paymentIntentSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() })
   }
 
-  res.json({ received: true })
+  try {
+    const order = await store.getOrder(parsed.data.orderId)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+
+    if (!config.mercadoPago.posId) {
+      return res.status(400).json({ error: 'MERCADOPAGO_POS_ID not configured' })
+    }
+
+    const intent = await mpRequest('/point/integrations/v1/payment-intents', {
+      method: 'POST',
+      body: JSON.stringify({
+        amount: Number((order.totalCents / 100).toFixed(2)),
+        description: `Pedido ${order.id}`,
+        external_reference: String(order.id),
+        pos_id: config.mercadoPago.posId,
+      }),
+    })
+
+    await store.attachPaymentIntent(order.id, intent.id)
+
+    return res.status(201).json({
+      status: intent.status,
+      paymentIntentId: intent.id,
+      orderId: order.id,
+    })
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.payload || err.message })
+  }
+})
+
+app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
+  const paymentIntentId = req.body?.data?.id || req.body?.id
+  if (!paymentIntentId) {
+    return res.status(400).json({ error: 'Payment intent id required' })
+  }
+
+  try {
+    const intent = await mpRequest(`/point/integrations/v1/payment-intents/${paymentIntentId}`)
+    const payment = intent.transactions?.payments?.[0]
+    const paymentId = payment?.id
+    const status = payment?.status || intent.status
+    const orderId = Number(intent.external_reference)
+
+    const order = Number.isNaN(orderId)
+      ? await store.findOrderByPaymentIntentId(paymentIntentId)
+      : await store.getOrder(orderId)
+
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+
+    const updated = await store.updateOrderFromPayment(order.id, paymentId, status)
+
+    if (paymentId) {
+      await store.createPayment({
+        orderId: updated.id,
+        provider: 'mercadopago',
+        status,
+        providerRef: paymentId,
+        receiptCode: updated.code,
+      })
+    }
+
+    return res.json({ received: true })
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.payload || err.message })
+  }
 })
 
 app.use((_req, res) => {

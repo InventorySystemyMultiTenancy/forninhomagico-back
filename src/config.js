@@ -9,6 +9,7 @@ const config = {
     publicKey: process.env.MERCADOPAGO_PUBLIC_KEY || '',
     deviceId: process.env.MERCADOPAGO_DEVICE_ID || '',
     terminalId: process.env.MERCADOPAGO_TERMINAL_ID || '',
+    posId: process.env.MERCADOPAGO_POS_ID || '122379696',
   },
 }
 
