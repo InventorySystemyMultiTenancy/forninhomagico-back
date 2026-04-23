@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS costs (
   label TEXT NOT NULL,
   amount_cents INTEGER NOT NULL CHECK (amount_cents >= 0),
   cadence TEXT NOT NULL DEFAULT 'monthly',
+  category TEXT NOT NULL DEFAULT 'operational',
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );

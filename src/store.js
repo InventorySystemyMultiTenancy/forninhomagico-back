@@ -70,20 +70,28 @@ async function addSlices(id, amount) {
 
 async function listCosts() {
   const { rows } = await db.query(
-    `SELECT id, label, amount_cents AS "amountCents", cadence
-     FROM costs WHERE is_active = true ORDER BY id`,
+    `SELECT id, label, amount_cents AS "amountCents", cadence, category
+     FROM costs WHERE is_active = true ORDER BY category, id`,
   )
   return rows
 }
 
 async function createCost(payload) {
   const { rows } = await db.query(
-    `INSERT INTO costs (label, amount_cents, cadence)
-     VALUES ($1, $2, $3)
-     RETURNING id, label, amount_cents AS "amountCents", cadence`,
-    [payload.label, payload.amountCents, payload.cadence],
+    `INSERT INTO costs (label, amount_cents, cadence, category)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, label, amount_cents AS "amountCents", cadence, category`,
+    [payload.label, payload.amountCents, payload.cadence, payload.category || 'operational'],
   )
   return rows[0]
+}
+
+async function deleteCost(id) {
+  const { rowCount } = await db.query(
+    `UPDATE costs SET is_active = false WHERE id = $1`,
+    [id],
+  )
+  return rowCount > 0
 }
 
 // ─── Orders ───────────────────────────────────────────────────────────────────
@@ -288,15 +296,21 @@ async function createPayment(payload) {
 // ─── Financials ───────────────────────────────────────────────────────────────
 
 async function getFinancials() {
+  const PAID_STATUSES = `('em montagem', 'pronto', 'entregue')`
   const { rows: g } = await db.query(
-    `SELECT COALESCE(SUM(total_cents), 0) AS gross FROM orders WHERE status != 'aguardando pagamento'`,
+    `SELECT COALESCE(SUM(total_cents), 0) AS gross FROM orders WHERE status IN ${PAID_STATUSES}`,
   )
-  const { rows: c } = await db.query(
-    `SELECT COALESCE(SUM(amount_cents), 0) AS costs FROM costs WHERE is_active = true`,
+  const { rows: op } = await db.query(
+    `SELECT COALESCE(SUM(amount_cents), 0) AS costs FROM costs WHERE is_active = true AND category = 'operational'`,
+  )
+  const { rows: pr } = await db.query(
+    `SELECT COALESCE(SUM(amount_cents), 0) AS costs FROM costs WHERE is_active = true AND category = 'product'`,
   )
   const gross = Number(g[0].gross)
-  const costs = Number(c[0].costs)
-  return { gross, costs, net: gross - costs }
+  const operationalCosts = Number(op[0].costs)
+  const productCosts = Number(pr[0].costs)
+  const totalCosts = operationalCosts + productCosts
+  return { gross, operationalCosts, productCosts, totalCosts, net: gross - totalCosts }
 }
 
 module.exports = {
@@ -306,6 +320,7 @@ module.exports = {
   addSlices,
   listCosts,
   createCost,
+  deleteCost,
   listOrders,
   getOrder,
   findOrderByPaymentIntentId,

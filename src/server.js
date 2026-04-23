@@ -29,7 +29,8 @@ const slicesSchema = z.object({
 const costSchema = z.object({
   label: z.string().min(2),
   amountCents: z.number().int().positive(),
-  cadence: z.enum(['monthly']),
+  cadence: z.enum(['monthly', 'once']),
+  category: z.enum(['operational', 'product']).optional().default('operational'),
 })
 
 const orderSchema = z.object({
@@ -140,6 +141,18 @@ app.post('/api/costs', async (req, res) => {
   try {
     const cost = await store.createCost(parsed.data)
     return res.status(201).json(cost)
+  } catch {
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.delete('/api/costs/:id', async (req, res) => {
+  const id = Number(req.params.id)
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'ID inválido' })
+  try {
+    const deleted = await store.deleteCost(id)
+    if (!deleted) return res.status(404).json({ error: 'Custo não encontrado' })
+    return res.status(204).send()
   } catch {
     return res.status(500).json({ error: 'Internal server error' })
   }
