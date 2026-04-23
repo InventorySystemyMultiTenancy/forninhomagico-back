@@ -123,6 +123,30 @@ function resolveOrderIdFromPayment(payment) {
   return NaN
 }
 
+async function resolveOrderByPaymentFallback(payment) {
+  const directOrderId = resolveOrderIdFromPayment(payment)
+  if (!Number.isNaN(directOrderId)) {
+    const order = await store.getOrder(directOrderId)
+    if (order) return order
+  }
+
+  const merchantOrderId = payment?.order?.id
+  if (merchantOrderId) {
+    try {
+      const mo = await mpRequest(`/merchant_orders/${merchantOrderId}`)
+      const moOrderId = Number(mo.external_reference)
+      if (!Number.isNaN(moOrderId)) {
+        const order = await store.getOrder(moOrderId)
+        if (order) return order
+      }
+    } catch (err) {
+      console.warn('[webhook] falha ao resolver merchant_order:', err?.payload || err?.message)
+    }
+  }
+
+  return null
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
 })
@@ -458,19 +482,13 @@ app.post('/api/notifications/mercadopago', async (req, res) => {
   if (topic === 'payment' && paymentId) {
     try {
       const payment = await mpRequest(`/v1/payments/${paymentId}`)
-      const orderId = resolveOrderIdFromPayment(payment)
       const status = payment.status
       const mpPaymentId = String(payment.id)
 
-      console.log(`[notifications] payment ${mpPaymentId} status=${status} orderId=${orderId}`)
-
-      if (Number.isNaN(orderId)) {
-        console.warn('[notifications] não foi possível resolver orderId no payment:', payment.id)
-        return res.status(200).json({ received: true })
-      }
-
-      const order = await store.getOrder(orderId)
+      const order = await resolveOrderByPaymentFallback(payment)
       if (!order) return res.status(200).json({ received: true })
+
+      console.log(`[notifications] payment ${mpPaymentId} status=${status} orderId=${order.id}`)
 
       if (order.status === 'em montagem' || order.status === 'pronto') {
         return res.status(200).json({ received: true })
@@ -482,7 +500,7 @@ app.post('/api/notifications/mercadopago', async (req, res) => {
           orderId: updated.id, provider: 'mercadopago', status: 'approved',
           providerRef: mpPaymentId, receiptCode: updated.code,
         })
-        console.log(`[notifications] pedido ${orderId} aprovado, code=${updated.code}`)
+        console.log(`[notifications] pedido ${order.id} aprovado, code=${updated.code}`)
         await clearPosOrder()
       }
       return res.json({ received: true })
@@ -536,15 +554,20 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
       const payment = (intent.payment ?? intent.transactions?.payments?.[0])
       const mpPaymentId = payment?.id ? String(payment.id) : null
       const status = payment?.status ?? intent.state
-      const orderId = Number(intent.additional_info?.external_reference ?? intent.external_reference)
 
-      if (Number.isNaN(orderId)) {
-        console.warn('[webhook] external_reference inválido:', intent)
-        return res.status(200).json({ received: true })
+      const resolvedOrderId = Number(intent.additional_info?.external_reference ?? intent.external_reference)
+      let order = null
+      if (!Number.isNaN(resolvedOrderId)) {
+        order = await store.getOrder(resolvedOrderId)
+      }
+      if (!order) {
+        order = await store.findOrderByPaymentIntentId(String(intentId))
       }
 
-      const order = await store.getOrder(orderId)
-      if (!order) return res.status(200).json({ received: true })
+      if (!order) {
+        console.warn('[webhook] não foi possível resolver pedido para payment_intent:', intentId)
+        return res.status(200).json({ received: true })
+      }
 
       const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, status === 'FINISHED' ? 'approved' : status)
       if (status === 'FINISHED' && mpPaymentId) {
@@ -552,7 +575,7 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
           orderId: updated.id, provider: 'mercadopago', status: 'approved',
           providerRef: mpPaymentId, receiptCode: updated.code,
         })
-        console.log(`[webhook] Point: pedido ${orderId} aprovado, code=${updated.code}`)
+        console.log(`[webhook] Point: pedido ${order.id} aprovado, code=${updated.code}`)
       }
       return res.json({ received: true })
     } catch (err) {
@@ -600,9 +623,7 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
     if (!paymentId) return res.status(200).json({ received: true })
     try {
       const payment = await mpRequest(`/v1/payments/${paymentId}`)
-      const orderId = resolveOrderIdFromPayment(payment)
-      if (Number.isNaN(orderId)) return res.status(200).json({ received: true })
-      const order = await store.getOrder(orderId)
+      const order = await resolveOrderByPaymentFallback(payment)
       if (!order) return res.status(200).json({ received: true })
       const updated = await store.updateOrderFromPayment(order.id, String(payment.id), payment.status)
       if (payment.status === 'approved') {
@@ -610,7 +631,7 @@ app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
           orderId: updated.id, provider: 'mercadopago', status: 'approved',
           providerRef: String(payment.id), receiptCode: updated.code,
         })
-        console.log(`[webhook] payment: pedido ${orderId} aprovado, code=${updated.code}`)
+        console.log(`[webhook] payment: pedido ${order.id} aprovado, code=${updated.code}`)
       }
       return res.json({ received: true })
     } catch (err) {
