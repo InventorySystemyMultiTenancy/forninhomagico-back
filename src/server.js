@@ -485,18 +485,31 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
     console.log('[clear-queue] iniciando limpeza forçada da fila...')
 
     let intentsDeleted = 0
+    let intentsFailedToDelete = []
+    
     try {
+      console.log('[clear-queue] listando intents da API...')
       const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
       const intents = Array.isArray(response) ? response : (Array.isArray(response?.results) ? response.results : [])
+      console.log(`[clear-queue] encontrados ${intents.length} intents`)
 
       for (const intent of intents) {
         if (intent?.id) {
-          await cancelPointIntent(String(intent.id))
-          intentsDeleted++
+          try {
+            await mpRequest(
+              `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intent.id}`,
+              { method: 'DELETE' },
+            )
+            console.log(`[clear-queue] intent ${intent.id} deletado`)
+            intentsDeleted++
+          } catch (err) {
+            console.warn(`[clear-queue] falha ao deletar intent ${intent.id}:`, err?.payload?.error || err?.message)
+            intentsFailedToDelete.push(intent.id)
+          }
         }
       }
     } catch (err) {
-      console.warn('[clear-queue] não conseguiu listar intents da API, continuando com banco...', err?.payload || err?.message)
+      console.warn('[clear-queue] não conseguiu listar intents da API:', err?.payload || err?.message)
     }
 
     // Limpa QR order também
@@ -516,16 +529,145 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
       }
     }
 
-    console.log(`[clear-queue] concluído: ${intentsDeleted} intents deletados na maquininha, ${ordersCleaned} pedidos limpos no banco`)
+    console.log(`[clear-queue] concluído: ${intentsDeleted} intents deletados (${intentsFailedToDelete.length} falharam), ${ordersCleaned} pedidos limpos no banco`)
     return res.json({
       success: true,
       intentsDeleted,
+      intentsFailedToDelete: intentsFailedToDelete.length > 0 ? intentsFailedToDelete : undefined,
       ordersCleaned,
-      message: 'Fila da maquininha limpa com sucesso',
+      message: intentsFailedToDelete.length > 0 
+        ? `${intentsDeleted} intents deletados, mas ${intentsFailedToDelete.length} não conseguiram ser deletados. Tente novamente ou use POST /api/payments/mercadopago/pos/force-reset`
+        : 'Fila da maquininha limpa com sucesso',
     })
   } catch (err) {
     console.error('[clear-queue] erro:', err)
     return res.status(500).json({ error: err.message || 'Falha ao limpar fila' })
+  }
+})
+
+// Reset total: força nullificação de TODOS os intents no banco SEM tentar deletar da API
+app.post('/api/payments/mercadopago/pos/force-reset', async (_req, res) => {
+  try {
+    console.log('[force-reset] iniciando reset total do sistema...')
+
+    // 1. Limpa QR order (sem falhar se erro)
+    try {
+      await clearPosOrder()
+      console.log('[force-reset] QR order limpo')
+    } catch (err) {
+      console.warn('[force-reset] falha ao limpar QR:', err?.message)
+    }
+
+    // 2. Nullifica TODOS os intents no banco (garantia de atomicidade)
+    const db = require('pg').Pool ? null : require('pg').Client // fallback
+    const allOrders = await store.listOrders()
+    let ordersCleaned = 0
+    const failedOrders = []
+
+    for (const order of allOrders) {
+      if (order.paymentIntentId) {
+        try {
+          await store.attachPaymentIntent(order.id, null)
+          console.log(`[force-reset] pedido ${order.id}: intent ${order.paymentIntentId} removido do banco`)
+          ordersCleaned++
+        } catch (err) {
+          console.error(`[force-reset] erro ao limpar pedido ${order.id}:`, err?.message)
+          failedOrders.push({ orderId: order.id, error: err?.message })
+        }
+      }
+    }
+
+    // 3. Log final
+    console.log(`[force-reset] concluído: ${ordersCleaned} pedidos limpos`)
+    
+    return res.json({
+      success: failedOrders.length === 0,
+      ordersCleaned,
+      failedOrders: failedOrders.length > 0 ? failedOrders : undefined,
+      message: failedOrders.length === 0
+        ? 'Sistema resetado com sucesso. Todos os intents foram removidos do banco.'
+        : `${ordersCleaned} pedidos limpos, mas ${failedOrders.length} falharam. Verifique o banco manualmente.`,
+      nextSteps: 'Agora você pode tentar criar um novo intent normalmente.',
+    })
+  } catch (err) {
+    console.error('[force-reset] erro crítico:', err)
+    return res.status(500).json({ 
+      error: err.message || 'Falha crítica no reset',
+      hint: 'Contacte suporte técnico se o problema persistir'
+    })
+  }
+})
+
+// Force sync: consulta intent na API e marca pedido como pago se pagamento foi aprovado
+app.post('/api/payments/mercadopago/pos/force-sync/:orderId', async (req, res) => {
+  const orderId = Number(req.params.orderId)
+  
+  if (Number.isNaN(orderId)) {
+    return res.status(400).json({ error: 'orderId inválido' })
+  }
+
+  try {
+    const order = await store.getOrder(orderId)
+    if (!order) {
+      return res.status(404).json({ error: `Pedido ${orderId} não encontrado` })
+    }
+
+    if (!order.paymentIntentId) {
+      return res.status(400).json({ error: `Pedido ${orderId} não tem payment_intent associado` })
+    }
+
+    console.log(`[force-sync] consultando intent ${order.paymentIntentId} para pedido ${orderId}...`)
+
+    // Consulta intent na API
+    const intent = await mpRequest(`/point/integration-api/payment-intents/${order.paymentIntentId}`)
+    const payment = intent.payment ?? intent.transactions?.payments?.[0]
+    const mpPaymentId = payment?.id ? String(payment.id) : null
+    const paymentStatus = payment?.status ?? intent.state
+
+    console.log(`[force-sync] intent ${order.paymentIntentId}: status=${paymentStatus}, payment_id=${mpPaymentId}`)
+
+    // Se pagamento foi aprovado, marca pedido como pago
+    if (paymentStatus === 'FINISHED' || paymentStatus === 'approved') {
+      const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, 'approved')
+      if (mpPaymentId) {
+        await store.createPayment({
+          orderId: updated.id,
+          provider: 'mercadopago',
+          status: 'approved',
+          providerRef: mpPaymentId,
+          receiptCode: updated.code,
+        })
+      }
+      console.log(`[force-sync] pedido ${orderId} marcado como pago, code=${updated.code}`)
+      
+      await clearPosOrder()
+
+      return res.json({
+        success: true,
+        message: `Pedido ${orderId} atualizado para PAGO`,
+        orderId,
+        status: updated.status,
+        code: updated.code,
+        paymentStatus,
+      })
+    } else {
+      // Se ainda não foi aprovado, apenas retorna o status
+      return res.json({
+        success: false,
+        message: `Pagamento ainda não foi aprovado (status: ${paymentStatus})`,
+        orderId,
+        currentStatus: order.status,
+        paymentStatus,
+        hint: 'Tente novamente em alguns segundos',
+      })
+    }
+  } catch (err) {
+    console.error(`[force-sync] erro:`, err)
+    return res.status(err.status || 500).json({
+      error: err.message,
+      payload: err.payload,
+      hint: 'Se o intent não existe mais, use POST /api/payments/mercadopago/pos/force-reset',
+    })
   }
 })
 
