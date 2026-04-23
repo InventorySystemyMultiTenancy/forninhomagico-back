@@ -157,8 +157,9 @@ app.get('/api/orders', async (req, res) => {
 app.get('/api/orders/ready', async (_req, res) => {
   try {
     res.json(await store.listOrders('pronto'))
-  } catch {
-    res.status(500).json({ error: 'Internal server error' })
+  } catch (err) {
+    console.error('[GET /api/orders/ready] erro:', err)
+    res.status(500).json({ error: 'Internal server error', detail: err.message })
   }
 })
 
@@ -196,73 +197,126 @@ app.get('/api/financials', async (_req, res) => {
 
 app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
   const parsed = paymentIntentSchema.safeParse(req.body)
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() })
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  const { collectorId, qrStoreId, qrExternalPosId } = config.mercadoPago
+  if (!collectorId || !qrStoreId || !qrExternalPosId) {
+    return res.status(503).json({
+      error: 'QR POS não configurado. Defina MERCADOPAGO_COLLECTOR_ID, MERCADOPAGO_QR_STORE_ID e MERCADOPAGO_QR_EXTERNAL_POS_ID no Render.',
+    })
   }
 
   try {
     const order = await store.getOrder(parsed.data.orderId)
     if (!order) return res.status(404).json({ error: 'Order not found' })
-
-    if (!config.mercadoPago.posId) {
-      return res.status(400).json({ error: 'MERCADOPAGO_POS_ID not configured' })
+    if (order.status !== 'aguardando pagamento') {
+      return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
     }
 
-    const intent = await mpRequest('/point/integrations/v1/payment-intents', {
-      method: 'POST',
-      body: JSON.stringify({
-        amount: Number((order.totalCents / 100).toFixed(2)),
-        description: `Pedido ${order.id}`,
-        external_reference: String(order.id),
-        pos_id: config.mercadoPago.posId,
-      }),
-    })
+    const amountInReais = order.totalCents / 100
+    const body = {
+      external_reference: String(order.id),
+      items: [
+        {
+          sku_number: String(order.id),
+          category: 'food',
+          title: 'Pedido Forninho Mágico',
+          description: `Pedido #${order.id}`,
+          unit_price: amountInReais,
+          quantity: 1,
+          unit_measure: 'unit',
+          total_amount: amountInReais,
+        },
+      ],
+      total_amount: amountInReais,
+    }
 
-    await store.attachPaymentIntent(order.id, intent.id)
+    if (config.serverUrl) {
+      body.notification_url = `${config.serverUrl}/api/payments/mercadopago/pos/webhook`
+    }
 
-    return res.status(201).json({
-      status: intent.status,
-      paymentIntentId: intent.id,
-      orderId: order.id,
-    })
+    await mpRequest(
+      `/instore/qr/seller/collectors/${collectorId}/stores/${qrStoreId}/pos/${qrExternalPosId}/orders`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    )
+
+    console.log(`[pos/intent] QR order criado para pedido ${order.id}, R$${amountInReais.toFixed(2)}`)
+    return res.json({ success: true, orderId: order.id, totalCents: order.totalCents })
   } catch (err) {
+    console.error('[pos/intent] erro:', err)
     return res.status(err.status || 500).json({ error: err.payload || err.message })
   }
 })
 
+// Confirmação manual de pagamento (atendente clica após receber na maquininha)
+app.patch('/api/orders/:id/confirm', async (req, res) => {
+  const orderId = Number(req.params.id)
+  const providerRef = req.body.providerRef || `manual-${Date.now()}`
+  try {
+    const order = await store.getOrder(orderId)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    if (order.status !== 'aguardando pagamento') {
+      return res.status(400).json({ error: `Order already in status: ${order.status}` })
+    }
+    const updated = await store.markOrderPaid(orderId, providerRef)
+    await store.createPayment({
+      orderId: updated.id,
+      provider: 'manual',
+      status: 'approved',
+      providerRef,
+      receiptCode: updated.code,
+    })
+    console.log(`[confirm] pedido ${orderId} confirmado, code=${updated.code}`)
+    return res.json(updated)
+  } catch (err) {
+    console.error('[confirm] erro:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
-  const paymentIntentId = req.body?.data?.id || req.body?.id
-  if (!paymentIntentId) {
-    return res.status(400).json({ error: 'Payment intent id required' })
+  console.log('[webhook] recebido:', JSON.stringify(req.body))
+
+  // Suporte a formato v1 (topic) e v2 (action/type)
+  const topic = req.body?.type || req.body?.topic
+  const paymentId = req.body?.data?.id || req.body?.id
+
+  if (topic !== 'payment' || !paymentId) {
+    return res.status(200).json({ received: true })
   }
 
   try {
-    const intent = await mpRequest(`/point/integrations/v1/payment-intents/${paymentIntentId}`)
-    const payment = intent.transactions?.payments?.[0]
-    const paymentId = payment?.id
-    const status = payment?.status || intent.status
-    const orderId = Number(intent.external_reference)
+    const payment = await mpRequest(`/v1/payments/${paymentId}`)
+    const orderId = Number(payment.external_reference)
+    const status = payment.status
+    const mpPaymentId = String(payment.id)
 
-    const order = Number.isNaN(orderId)
-      ? await store.findOrderByPaymentIntentId(paymentIntentId)
-      : await store.getOrder(orderId)
+    console.log(`[webhook] payment ${mpPaymentId} status=${status} orderId=${orderId}`)
 
+    if (Number.isNaN(orderId)) {
+      console.warn('[webhook] external_reference inválido:', payment.external_reference)
+      return res.status(200).json({ received: true })
+    }
+
+    const order = await store.getOrder(orderId)
     if (!order) return res.status(404).json({ error: 'Order not found' })
 
-    const updated = await store.updateOrderFromPayment(order.id, paymentId, status)
+    const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, status)
 
-    if (paymentId) {
+    if (status === 'approved') {
       await store.createPayment({
         orderId: updated.id,
         provider: 'mercadopago',
         status,
-        providerRef: paymentId,
+        providerRef: mpPaymentId,
         receiptCode: updated.code,
       })
+      console.log(`[webhook] pedido ${orderId} aprovado, code=${updated.code}`)
     }
 
     return res.json({ received: true })
   } catch (err) {
+    console.error('[webhook] erro:', err)
     return res.status(err.status || 500).json({ error: err.payload || err.message })
   }
 })
