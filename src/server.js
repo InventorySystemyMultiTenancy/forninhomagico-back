@@ -187,6 +187,19 @@ app.patch('/api/orders/:id/status', async (req, res) => {
   }
 })
 
+app.get('/api/orders/:id', async (req, res) => {
+  const orderId = Number(req.params.id)
+  if (Number.isNaN(orderId)) return res.status(400).json({ error: 'Invalid order id' })
+  try {
+    const order = await store.getOrder(orderId)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    return res.json(order)
+  } catch (err) {
+    console.error('[GET /api/orders/:id] erro:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 app.delete('/api/orders/:id', async (req, res) => {
   const orderId = Number(req.params.id)
   if (Number.isNaN(orderId)) return res.status(400).json({ error: 'Invalid order id' })
@@ -280,6 +293,80 @@ app.patch('/api/orders/:id/confirm', async (req, res) => {
     console.error('[confirm] erro:', err)
     return res.status(500).json({ error: 'Internal server error' })
   }
+})
+
+// Rota alternativa usada pelo Mercado Pago Point (notification_url configurada no painel)
+app.post('/api/notifications/mercadopago', async (req, res) => {
+  console.log('[notifications] recebido:', JSON.stringify(req.body))
+
+  const topic = req.body?.type || req.body?.topic
+  // resource pode ser ID direto ou URL como "https://.../payments/123"
+  const rawResource = req.body?.resource || req.body?.data?.id
+  const paymentId = rawResource ? String(rawResource).split('/').pop() : null
+
+  if (topic === 'payment' && paymentId) {
+    try {
+      const payment = await mpRequest(`/v1/payments/${paymentId}`)
+      const orderId = Number(payment.external_reference)
+      const status = payment.status
+      const mpPaymentId = String(payment.id)
+
+      console.log(`[notifications] payment ${mpPaymentId} status=${status} orderId=${orderId}`)
+
+      if (Number.isNaN(orderId)) {
+        console.warn('[notifications] external_reference inválido:', payment.external_reference)
+        return res.status(200).json({ received: true })
+      }
+
+      const order = await store.getOrder(orderId)
+      if (!order) return res.status(200).json({ received: true })
+
+      if (order.status === 'em montagem' || order.status === 'pronto') {
+        return res.status(200).json({ received: true })
+      }
+
+      const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, status)
+      if (status === 'approved') {
+        await store.createPayment({
+          orderId: updated.id, provider: 'mercadopago', status: 'approved',
+          providerRef: mpPaymentId, receiptCode: updated.code,
+        })
+        console.log(`[notifications] pedido ${orderId} aprovado, code=${updated.code}`)
+      }
+      return res.json({ received: true })
+    } catch (err) {
+      console.error('[notifications] erro:', err)
+      return res.status(200).json({ received: true })
+    }
+  }
+
+  if (topic === 'merchant_order' && rawResource) {
+    try {
+      const moId = String(rawResource).split('/').pop()
+      const mo = await mpRequest(`/merchant_orders/${moId}`)
+      const approvedPayment = (mo.payments || []).find(p => p.status === 'approved')
+      if (!approvedPayment) return res.status(200).json({ received: true })
+      const orderId = Number(mo.external_reference)
+      if (Number.isNaN(orderId)) return res.status(200).json({ received: true })
+      const order = await store.getOrder(orderId)
+      if (!order || order.status === 'em montagem' || order.status === 'pronto') {
+        return res.status(200).json({ received: true })
+      }
+      const mpPaymentId = String(approvedPayment.id)
+      const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, 'approved')
+      await store.createPayment({
+        orderId: updated.id, provider: 'mercadopago', status: 'approved',
+        providerRef: mpPaymentId, receiptCode: updated.code,
+      })
+      console.log(`[notifications] merchant_order: pedido ${orderId} aprovado, code=${updated.code}`)
+      return res.json({ received: true })
+    } catch (err) {
+      console.error('[notifications] merchant_order erro:', err)
+      return res.status(200).json({ received: true })
+    }
+  }
+
+  return res.status(200).json({ received: true })
 })
 
 app.post('/api/payments/mercadopago/pos/webhook', async (req, res) => {
