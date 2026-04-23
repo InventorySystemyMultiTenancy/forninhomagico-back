@@ -369,6 +369,7 @@ async function clearPosOrder() {
 async function cancelPointIntent(intentId) {
   const { pointDeviceId } = config.mercadoPago
   if (!pointDeviceId || !intentId) return
+
   try {
     await mpRequest(
       `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intentId}`,
@@ -376,7 +377,12 @@ async function cancelPointIntent(intentId) {
     )
     console.log(`[pos] intent ${intentId} cancelado na maquininha`)
   } catch (err) {
-    console.warn('[pos] falha ao cancelar intent:', err?.payload || err?.message)
+    // Não falha se intent não existe na API (pode ter já sido deletado)
+    if (err?.status === 404) {
+      console.log(`[pos] intent ${intentId} já não existe na maquininha`)
+      return
+    }
+    throw err // relança outros erros
   }
 }
 
@@ -527,25 +533,65 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     }
 
     let intent
-    try {
-      intent = await createIntent()
-    } catch (err) {
-      if (!isQueuedIntentConflict(err)) throw err
+    let lastError
+    const MAX_RETRIES = 3
+    const INITIAL_DELAY = 500 // ms
 
-      // 409 significa fila travada: força limpeza TOTAL de intents no banco e tenta recriar UMA VEZ
-      console.log(`[pos/intent] 409 detectado, limpando TODOS os intents pendentes do banco...`)
-      const allOrders = await store.listOrders('aguardando pagamento')
-      let totalCancelled = 0
-      for (const o of allOrders) {
-        if (o.paymentIntentId) {
-          await cancelPointIntent(o.paymentIntentId)
-          totalCancelled++
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        intent = await createIntent()
+        break // sucesso, sai do loop
+      } catch (err) {
+        lastError = err
+        if (!isQueuedIntentConflict(err)) throw err // não é 409, relança
+
+        if (attempt < MAX_RETRIES) {
+          console.log(`[pos/intent] tentativa ${attempt}/${MAX_RETRIES}: 409 detectado, limpando intents...`)
+
+          // Cleanup agressivo em cada retry:
+          // 1. Lista intents da API e deleta todos
+          try {
+            const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
+            const intents = Array.isArray(response) ? response : (Array.isArray(response?.results) ? response.results : [])
+            for (const i of intents) {
+              if (i?.id) {
+                await cancelPointIntent(String(i.id))
+              }
+            }
+            console.log(`[pos/intent] ${intents.length} intent(s) deletado(s) da API`)
+          } catch (e) {
+            console.warn(`[pos/intent] não conseguiu listar intents da API:`, e?.message)
+          }
+
+          // 2. Remove intents do banco
+          try {
+            const allOrders = await store.listOrders('aguardando pagamento')
+            for (const o of allOrders) {
+              if (o.paymentIntentId) {
+                await store.attachPaymentIntent(o.id, null)
+              }
+            }
+            console.log(`[pos/intent] intents removidos do banco`)
+          } catch (e) {
+            console.warn(`[pos/intent] erro ao atualizar banco:`, e?.message)
+          }
+
+          // 3. Limpa QR order
+          await clearPosOrder()
+
+          // Delay antes da próxima tentativa (exponencial: 500ms, 1s, 2s)
+          const delayMs = INITIAL_DELAY * Math.pow(2, attempt - 1)
+          console.log(`[pos/intent] aguardando ${delayMs}ms antes de tentar novamente...`)
+          await new Promise(resolve => setTimeout(resolve, delayMs))
         }
       }
-      console.log(`[pos/intent] ${totalCancelled} intent(s) cancelado(s) da base, tentando criar novamente...`)
+    }
 
-      // Tenta criar uma única vez após limpeza total
-      intent = await createIntent()
+    // Se chegou aqui, intent ainda não foi criado
+    if (!intent) {
+      const msg = `Não conseguiu criar intent após ${MAX_RETRIES} tentativas. A fila da maquininha pode estar travada. Use POST /api/payments/mercadopago/pos/clear-queue`
+      console.error(`[pos/intent] ${msg}`)
+      throw Object.assign(new Error(msg), { status: 503, payload: lastError?.payload })
     }
 
     await store.attachPaymentIntent(order.id, intent.id)
