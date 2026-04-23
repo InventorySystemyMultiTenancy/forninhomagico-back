@@ -216,6 +216,9 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     const amountInReais = order.totalCents / 100
     const body = {
       external_reference: String(order.id),
+      title: 'Pedido Forninho Mágico',
+      description: `Pedido #${order.id}`,
+      total_amount: amountInReais,
       items: [
         {
           sku_number: String(order.id),
@@ -228,7 +231,6 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
           total_amount: amountInReais,
         },
       ],
-      total_amount: amountInReais,
     }
 
     if (config.serverUrl) {
