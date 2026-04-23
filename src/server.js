@@ -243,6 +243,7 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     const body = {
       amount: order.totalCents,
       description: `Pedido #${order.id} - Forninho Magico`,
+      external_reference: String(order.id),
       additional_info: {
         external_reference: String(order.id),
         print_on_terminal: true,
