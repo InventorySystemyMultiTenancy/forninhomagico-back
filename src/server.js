@@ -349,6 +349,19 @@ async function cancelPointIntent(intentId) {
   }
 }
 
+async function clearQueuedPointIntentsFromPendingOrders(currentOrderId) {
+  const pendingOrders = await store.listOrders('aguardando pagamento')
+  const intentsToCancel = pendingOrders
+    .filter((order) => order.id !== currentOrderId && order.paymentIntentId)
+    .map((order) => String(order.paymentIntentId))
+
+  for (const intentId of intentsToCancel) {
+    await cancelPointIntent(intentId)
+  }
+
+  return intentsToCancel.length
+}
+
 function normalizeIntentsList(payload) {
   if (Array.isArray(payload)) return payload
   if (Array.isArray(payload?.results)) return payload.results
@@ -466,6 +479,12 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       )
     }
 
+    // Prioriza o pedido atual limpando intents pendentes de outros pedidos na base
+    const cleared = await clearQueuedPointIntentsFromPendingOrders(order.id)
+    if (cleared > 0) {
+      console.log(`[pos/intent] ${cleared} intent(s) pendente(s) cancelado(s) antes de criar novo para pedido ${order.id}`)
+    }
+
     let intent
     try {
       intent = await createIntent()
@@ -486,7 +505,10 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
         })
       }
 
-      // Se não achar intent do mesmo pedido, tenta limpar fila e recriar 1x
+      // Se não achar intent do mesmo pedido via API, força limpeza pela base e tenta recriar 1x
+      await clearQueuedPointIntentsFromPendingOrders(order.id)
+
+      // Compatibilidade: caso listagem da API funcione, também cancela os retornados
       for (const pendingIntent of intents) {
         if (pendingIntent?.id) {
           await cancelPointIntent(String(pendingIntent.id))
