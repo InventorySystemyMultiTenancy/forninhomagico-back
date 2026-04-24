@@ -1099,44 +1099,57 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     }
 
     let intent
-    try {
-      intent = await createIntent()
-    } catch (err) {
-      if (!isQueuedIntentConflict(err)) throw err // não é 409, relança direto
-
-      // 409 detectado - fila travada. Tenta limpeza rápida UMA VEZ
-      console.warn(`[pos/intent] 409 detectado (fila travada), tentando limpeza rápida...`)
-
-      let cleanupReport = null
+    let attempt = 0
+    const maxAttempts = 3
+    
+    while (attempt < maxAttempts) {
+      attempt++
+      
       try {
-        cleanupReport = await runPointQueueCleanup(pointDeviceId, 'pos/intent-cleanup')
-        console.log(`[pos/intent] limpeza rápida: ${cleanupReport.intentsDeleted} deletados da API, ${cleanupReport.ordersCleaned} cancelados no banco, ${cleanupReport.ordersReconciled} reconciliados`)
-      } catch (e) {
-        console.warn(`[pos/intent] limpeza rápida falhou:`, e?.message)
-      }
-
-      // Tentar UMA VEZ mais
-      try {
-        console.log(`[pos/intent] tentando criar intent novamente...`)
         intent = await createIntent()
-      } catch (retryErr) {
-        if (isQueuedIntentConflict(retryErr)) {
-          // Se continua 409, não conseguimos resolver via cleanup - sugere clear-queue
+        break // Sucesso! Sai do loop
+      } catch (err) {
+        if (!isQueuedIntentConflict(err)) throw err // não é 409, relança direto
+
+        // 409 detectado - fila travada
+        console.warn(`[pos/intent] 409 detectado na tentativa ${attempt}/${maxAttempts}, limpando fila...`)
+
+        let cleanupReport = null
+        try {
+          // Limpeza completa: descobre e deleta todos os intents
+          cleanupReport = await runPointQueueCleanup(pointDeviceId, `pos/intent-auto-cleanup-${attempt}`)
+          console.log(`[pos/intent] limpeza ${attempt}: ${cleanupReport.intentsDeleted} deletados da API, ${cleanupReport.ordersCleaned} cancelados no banco, ${cleanupReport.ordersReconciled} reconciliados`)
+          
+          // Se não conseguiu descobrir nenhum intent na API, tenta force clear
+          if (cleanupReport.discoveredIntentCount === 0) {
+            console.warn(`[pos/intent] nenhum intent descoberto na API, tentando force clear no device...`)
+            await forceClearDeviceQueue(pointDeviceId, `pos/intent-force-${attempt}`)
+          }
+        } catch (e) {
+          console.warn(`[pos/intent] limpeza ${attempt} falhou:`, e?.message)
+        }
+
+        // Se for a última tentativa e ainda falhou, lança erro
+        if (attempt >= maxAttempts) {
           const msg = cleanupReport?.likelyManualTerminalActionRequired
-            ? 'Fila presa no terminal (intent não visível na API). Cancele a operação diretamente na maquininha e reinicie o modo integração.'
-            : 'Fila da maquininha travada com intent não identificado. Execute: POST /api/payments/mercadopago/pos/clear-queue'
+            ? 'Fila presa no terminal após múltiplas tentativas. Cancele a operação diretamente na maquininha e reinicie o modo integração.'
+            : 'Fila da maquininha travada mesmo após limpeza automática. Tente reiniciar o modo integração na maquininha.'
           console.error(`[pos/intent] ${msg}`)
           throw Object.assign(new Error(msg), {
             status: 503,
             payload: {
-              ...retryErr?.payload,
+              ...err?.payload,
               clearQueueRequired: true,
               manualTerminalActionRequired: Boolean(cleanupReport?.likelyManualTerminalActionRequired),
               cleanupReport,
+              attemptsExhausted: maxAttempts,
             }
           })
         }
-        throw retryErr
+        
+        // Aguarda 1 segundo antes da próxima tentativa
+        console.log(`[pos/intent] aguardando 1s antes da tentativa ${attempt + 1}...`)
+        await new Promise(resolve => setTimeout(resolve, 1000))
       }
     }
 
