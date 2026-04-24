@@ -711,6 +711,15 @@ app.get('/api/payments/mercadopago/pos/intent-status/:orderId', async (req, res)
     const order = await store.getOrder(orderId)
     if (!order) return res.status(404).json({ error: 'Pedido não encontrado' })
 
+    if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado' || order.status === 'entregue') {
+      return res.json({
+        success: true,
+        message: 'Pedido já confirmado como pago',
+        orderId,
+        orderStatus: order.status,
+      })
+    }
+
     if (!order.paymentIntentId) {
       return res.json({
         success: false,
@@ -1007,6 +1016,11 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
   try {
     const order = await store.getOrder(parsed.data.orderId)
     if (!order) return res.status(404).json({ error: 'Order not found' })
+    if (order.paymentMethod !== 'point') {
+      return res.status(400).json({
+        error: `Pedido ${order.id} está com método ${order.paymentMethod}. A intent Point só pode ser criada para pedidos com paymentMethod=point.`,
+      })
+    }
     if (order.status !== 'aguardando pagamento') {
       return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
     }
@@ -1202,6 +1216,17 @@ function normalizePaymentState(status) {
   return normalized
 }
 
+function isLikelyNonPointPayment(payment) {
+  const paymentType = String(payment?.payment_type_id || '').toLowerCase()
+  const pointType = String(payment?.point_of_interaction?.type || '').toLowerCase()
+  const description = String(payment?.description || '').toLowerCase()
+
+  if (pointType.includes('point') || pointType.includes('pos')) return false
+  if (paymentType === 'bank_transfer') return true
+  if (description.includes('pix')) return true
+  return false
+}
+
 async function reconcileOrderByPointIntent(order, sourceTag) {
   if (!order?.paymentIntentId) return false
 
@@ -1274,6 +1299,10 @@ async function processPaymentNotification(paymentId, sourceTag) {
     let order = await resolveOrderByPaymentFallback(payment)
     if (!order) order = await resolveOrderByPaymentIdFromIntents(mpPaymentId)
     if (!order) {
+      if (isLikelyNonPointPayment(payment)) {
+        console.log(`[${sourceTag}] payment ${mpPaymentId} ignorado: parece ser PIX/não-Point e não tem vínculo com pedido local`)
+        return
+      }
       console.warn(`[${sourceTag}] payment ${mpPaymentId} sem pedido correspondente (debug: nenhuma estratégia em resolveOrderBy* funcionou)`)
       return
     }
