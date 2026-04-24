@@ -1340,12 +1340,12 @@ function startPointIntentWatcher(intentId, orderId) {
     attempts++
     
     try {
-      // Busca status do intent
-      const intentData = await mpRequest(`/point/integration-api/devices/${config.mercadoPago.deviceId}/payment-intents/${intentId}`, {
-        method: 'GET',
-      })
+      // Busca status do intent (rota correta: sem /devices/{deviceId}/)
+      const intentData = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
       
-      const state = normalizePaymentState(intentData.state)
+      const payment = intentData.payment ?? intentData.transactions?.payments?.[0]
+      const paymentStatus = payment?.status ?? intentData.state
+      const state = normalizePaymentState(paymentStatus)
       console.log(`[intent-watcher] intent ${intentId} (pedido ${orderId}): tentativa ${attempts}/${maxAttempts}, state=${state}`)
       
       if (state === 'approved') {
@@ -1355,7 +1355,7 @@ function startPointIntentWatcher(intentId, orderId) {
         const order = await store.getOrder(orderId)
         if (order?.paymentIntentId === intentId) {
           console.log(`[intent-watcher] pagamento aprovado detectado via polling para pedido ${orderId}`)
-          await reconcileOrderViaIntent(order, 'intent-watcher-polling')
+          await reconcileOrderByPointIntent(order, 'intent-watcher-polling')
         }
       } else if (state === 'rejected' || state === 'cancelled') {
         // Pagamento rejeitado/cancelado - para o monitoramento
