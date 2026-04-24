@@ -796,6 +796,71 @@ app.get('/api/payments/mercadopago/pos/intent-status/:orderId', async (req, res)
   }
 })
 
+async function runPointQueueCleanup(pointDeviceId, sourceTag) {
+  let intentsDeleted = 0
+  const intentsFailedToDelete = []
+  let discoveredIntentCount = 0
+
+  try {
+    const intentIds = await discoverPointIntentIds(pointDeviceId, sourceTag)
+    discoveredIntentCount = intentIds.length
+
+    for (const intentId of intentIds) {
+      if (!intentId) continue
+      try {
+        await cancelPointIntent(String(intentId))
+        intentsDeleted++
+      } catch (err) {
+        intentsFailedToDelete.push(String(intentId))
+        console.warn(`[${sourceTag}] falha ao deletar intent ${intentId}:`, err?.payload?.error || err?.message)
+      }
+    }
+  } catch (err) {
+    console.warn(`[${sourceTag}] não conseguiu descobrir intents da API:`, err?.payload || err?.message)
+  }
+
+  const allOrders = await store.listOrders()
+  let ordersCleaned = 0
+  let ordersReconciled = 0
+  let ordersWithIntent = 0
+
+  for (const order of allOrders) {
+    if (!order.paymentIntentId) continue
+    ordersWithIntent++
+
+    try {
+      const reconciled = await reconcileOrderByPointIntent(order, sourceTag)
+      if (reconciled) {
+        ordersReconciled++
+        continue
+      }
+
+      await cancelPointIntent(order.paymentIntentId)
+      await store.attachPaymentIntent(order.id, null)
+      ordersCleaned++
+    } catch (err) {
+      console.warn(`[${sourceTag}] falha ao limpar intent do pedido ${order.id}:`, err?.message)
+    }
+  }
+
+  const likelyManualTerminalActionRequired =
+    discoveredIntentCount === 0 &&
+    intentsDeleted === 0 &&
+    ordersWithIntent === 0 &&
+    ordersCleaned === 0 &&
+    ordersReconciled === 0
+
+  return {
+    discoveredIntentCount,
+    intentsDeleted,
+    intentsFailedToDelete,
+    ordersWithIntent,
+    ordersCleaned,
+    ordersReconciled,
+    likelyManualTerminalActionRequired,
+  }
+}
+
 app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
   const { pointDeviceId } = config.mercadoPago
   if (!pointDeviceId) {
@@ -807,63 +872,18 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
   try {
     console.log('[clear-queue] iniciando limpeza forçada da fila...')
 
-    let intentsDeleted = 0
-    let intentsFailedToDelete = []
-    
-    try {
-      console.log('[clear-queue] listando intents da API...')
-      const intentIds = await discoverPointIntentIds(pointDeviceId, 'clear-queue')
-      console.log(`[clear-queue] encontrados ${intentIds.length} intents`)
+    const cleanup = await runPointQueueCleanup(pointDeviceId, 'clear-queue')
 
-      for (const intentId of intentIds) {
-        if (intentId) {
-          try {
-            await cancelPointIntent(String(intentId))
-            console.log(`[clear-queue] intent ${intentId} deletado`)
-            intentsDeleted++
-          } catch (err) {
-            console.warn(`[clear-queue] falha ao deletar intent ${intentId}:`, err?.payload?.error || err?.message)
-            intentsFailedToDelete.push(intentId)
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('[clear-queue] não conseguiu listar intents da API:', err?.payload || err?.message)
-    }
-
-    // Fallback importante: tenta cancelar intents já vinculados no banco
-    // (quando listagem da API falha, ainda conseguimos limpar a fila da maquininha)
-    const allOrders = await store.listOrders()
-    let ordersCleaned = 0
-    let ordersReconciled = 0
-    for (const order of allOrders) {
-      if (order.paymentIntentId) {
-        try {
-          const reconciled = await reconcileOrderByPointIntent(order, 'clear-queue')
-          if (reconciled) {
-            ordersReconciled++
-            continue
-          }
-
-          await cancelPointIntent(order.paymentIntentId)
-          await store.attachPaymentIntent(order.id, null)
-          ordersCleaned++
-        } catch (err) {
-          console.warn(`[clear-queue] falha ao limpar intent do pedido ${order.id}:`, err?.message)
-        }
-      }
-    }
-
-    console.log(`[clear-queue] concluído: ${intentsDeleted} intents deletados (${intentsFailedToDelete.length} falharam), ${ordersCleaned} pedidos limpos no banco, ${ordersReconciled} pedidos reconciliados`)
+    console.log(`[clear-queue] concluído: ${cleanup.intentsDeleted} intents deletados (${cleanup.intentsFailedToDelete.length} falharam), ${cleanup.ordersCleaned} pedidos limpos no banco, ${cleanup.ordersReconciled} pedidos reconciliados`)
     return res.json({
       success: true,
-      intentsDeleted,
-      intentsFailedToDelete: intentsFailedToDelete.length > 0 ? intentsFailedToDelete : undefined,
-      ordersCleaned,
-      ordersReconciled,
-      message: intentsFailedToDelete.length > 0 
-        ? `${intentsDeleted} intents deletados, mas ${intentsFailedToDelete.length} não conseguiram ser deletados. Tente novamente ou use POST /api/payments/mercadopago/pos/force-reset`
-        : 'Fila da maquininha limpa com sucesso',
+      ...cleanup,
+      intentsFailedToDelete: cleanup.intentsFailedToDelete.length > 0 ? cleanup.intentsFailedToDelete : undefined,
+      message: cleanup.likelyManualTerminalActionRequired
+        ? 'Não há intents visíveis na API nem no banco. A fila parece estar presa apenas no terminal. Cancele na maquininha e reinicie o modo integração.'
+        : cleanup.intentsFailedToDelete.length > 0
+          ? `${cleanup.intentsDeleted} intents deletados, mas ${cleanup.intentsFailedToDelete.length} não conseguiram ser deletados. Tente novamente ou use POST /api/payments/mercadopago/pos/force-reset`
+          : 'Fila da maquininha limpa com sucesso',
     })
   } catch (err) {
     console.error('[clear-queue] erro:', err)
@@ -1069,20 +1089,10 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       // 409 detectado - fila travada. Tenta limpeza rápida UMA VEZ
       console.warn(`[pos/intent] 409 detectado (fila travada), tentando limpeza rápida...`)
 
+      let cleanupReport = null
       try {
-        let intentsDeleted = 0
-        const intentIds = await discoverPointIntentIds(pointDeviceId, 'pos/intent-cleanup')
-        for (const intentId of intentIds) {
-          try {
-            await cancelPointIntent(String(intentId))
-            intentsDeleted++
-          } catch (deleteErr) {
-            console.warn(`[pos/intent] falha ao deletar intent ${intentId} no cleanup:`, deleteErr?.message)
-          }
-        }
-
-        const dbCleanup = await cancelKnownIntentsFromDatabase('pos/intent-cleanup')
-        console.log(`[pos/intent] limpeza rápida: ${intentsDeleted} deletados da API, ${dbCleanup.cancelled} cancelados no banco, ${dbCleanup.reconciled} reconciliados`)
+        cleanupReport = await runPointQueueCleanup(pointDeviceId, 'pos/intent-cleanup')
+        console.log(`[pos/intent] limpeza rápida: ${cleanupReport.intentsDeleted} deletados da API, ${cleanupReport.ordersCleaned} cancelados no banco, ${cleanupReport.ordersReconciled} reconciliados`)
       } catch (e) {
         console.warn(`[pos/intent] limpeza rápida falhou:`, e?.message)
       }
@@ -1094,11 +1104,18 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       } catch (retryErr) {
         if (isQueuedIntentConflict(retryErr)) {
           // Se continua 409, não conseguimos resolver via cleanup - sugere clear-queue
-          const msg = `Fila da maquininha travada com intent não identificado. Execute: POST /api/payments/mercadopago/pos/clear-queue`
+          const msg = cleanupReport?.likelyManualTerminalActionRequired
+            ? 'Fila presa no terminal (intent não visível na API). Cancele a operação diretamente na maquininha e reinicie o modo integração.'
+            : 'Fila da maquininha travada com intent não identificado. Execute: POST /api/payments/mercadopago/pos/clear-queue'
           console.error(`[pos/intent] ${msg}`)
           throw Object.assign(new Error(msg), {
             status: 503,
-            payload: { ...retryErr?.payload, clearQueueRequired: true }
+            payload: {
+              ...retryErr?.payload,
+              clearQueueRequired: true,
+              manualTerminalActionRequired: Boolean(cleanupReport?.likelyManualTerminalActionRequired),
+              cleanupReport,
+            }
           })
         }
         throw retryErr
