@@ -1127,10 +1127,65 @@ function extractNotificationTopicAndResource(source) {
   return { topic, rawResource: rawResource ? String(rawResource) : null }
 }
 
+async function processPointOrderNotification(orderId, notificationBody, sourceTag) {
+  try {
+    const action = String(notificationBody?.action || '').toLowerCase()
+    const orderData = notificationBody?.data || {}
+    const orderStatus = String(orderData.status || '').toLowerCase()
+    const payments = orderData.transactions?.payments || []
+    const payment = payments[0] || {}
+    const paymentStatus = String(payment.status || '').toLowerCase()
+    const paymentId = payment.id ? String(payment.id) : null
+
+    console.log(
+      `[${sourceTag}] order=${orderId} action=${action} status=${orderStatus} payment_status=${paymentStatus} payment_id=${paymentId}`,
+    )
+
+    if (!orderId) {
+      console.warn(`[${sourceTag}] orderId ausente na notificação, ignorando`)
+      return
+    }
+
+    const order = await store.getOrder(Number(orderId))
+    if (!order) {
+      console.warn(`[${sourceTag}] order ${orderId} não encontrada no banco`)
+      return
+    }
+
+    // Mapeamento oficial de status da API Point
+    if (action === 'order.processed' && orderStatus === 'processed') {
+      // ✅ Pagamento confirmado - transição para "em montagem"
+      console.log(`[${sourceTag}] ✅ Pagamento processado: order ${orderId}`, { paymentStatus, detail: payment.status_detail })
+      await store.updateOrderFromPayment(order.id, paymentId, 'approved')
+      await releasePointQueueForOrder(order, sourceTag)
+    } else if (action === 'order.action_required') {
+      // ⏳ Aguardando confirmação no terminal
+      console.log(`[${sourceTag}] ⏳ Aguardando confirmação: order ${orderId}`)
+    } else if (action === 'order.failed' && orderStatus === 'failed') {
+      // ❌ Pagamento rejeitado
+      console.log(`[${sourceTag}] ❌ Pagamento falhou: order ${orderId}`, { reason: payment.status_detail })
+      await store.attachPaymentIntent(order.id, null)
+    } else if (action === 'order.canceled' && orderStatus === 'canceled') {
+      // ❌ Cancelado
+      console.log(`[${sourceTag}] ❌ Order cancelada: ${orderId}`)
+      await store.attachPaymentIntent(order.id, null)
+    } else if (action === 'order.expired' && orderStatus === 'expired') {
+      // ⏱️ Expirou
+      console.log(`[${sourceTag}] ⏱️ Order expirada: ${orderId}`)
+      await store.attachPaymentIntent(order.id, null)
+    } else if (action !== 'order.refunded') {
+      // order.refunded é ignorado por enquanto
+      console.log(`[${sourceTag}] evento de order não reconhecido (aguardando tratamento): action=${action} status=${orderStatus}`)
+    }
+  } catch (err) {
+    console.error(`[${sourceTag}] erro ao processar notificação de order:`, err?.message || err)
+  }
+}
+
 function normalizePaymentState(status) {
   const normalized = String(status || '').toLowerCase().trim()
   // FINISHED é o status oficial do Point quando pagamento é completado
-  if (normalized === 'finished' || normalized === 'approved' || normalized === 'authorized' || normalized === 'accredited') return 'approved'
+  if (normalized === 'finished' || normalized === 'approved' || normalized === 'authorized' || normalized === 'accredited' || normalized === 'processed') return 'approved'
   if (normalized === 'rejected' || normalized === 'refunded' || normalized === 'charged_back') return 'rejected'
   if (normalized === 'canceled' || normalized === 'cancelled' || normalized === 'error') return 'cancelled'
   return normalized
@@ -1311,6 +1366,14 @@ async function processMercadoPagoNotification(source, sourceTag) {
 
   if (!topic || !resourceId) return
 
+  // API NOVA do Mercado Pago Point (atual)
+  // Webhooks de order: order.processed, order.action_required, order.failed, order.canceled, order.refunded, order.expired
+  if (topic === 'order.processed' || topic === 'order.action_required' || topic === 'order.failed' || topic === 'order.canceled' || topic === 'order.refunded' || topic === 'order.expired') {
+    await processPointOrderNotification(resourceId, source.body, sourceTag)
+    return
+  }
+
+  // Webhooks antigos/legados (compatibilidade)
   if (topic === 'payment' || topic.startsWith('payment.')) {
     await processPaymentNotification(resourceId, sourceTag)
     return
@@ -1321,7 +1384,7 @@ async function processMercadoPagoNotification(source, sourceTag) {
     return
   }
 
-  // IPN clássico do Point
+  // IPN clássico do Point (API legada)
   if (
     topic === 'point_integration_ipn' ||
     topic === 'payment_intent' ||
