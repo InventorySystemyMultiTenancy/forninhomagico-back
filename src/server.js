@@ -3,6 +3,7 @@ const cors = require('cors')
 const multer = require('multer')
 const { v2: cloudinary } = require('cloudinary')
 const { z } = require('zod')
+const crypto = require('crypto')
 const { config } = require('./config')
 const store = require('./store')
 
@@ -1186,6 +1187,9 @@ app.post('/api/payments/mercadopago/pix/create', async (req, res) => {
 
     const payment = await mpRequest('/v1/payments', {
       method: 'POST',
+      headers: {
+        'X-Idempotency-Key': crypto.randomUUID(), // Header obrigatório para pagamentos
+      },
       body: JSON.stringify(pixPaymentBody),
     })
 
