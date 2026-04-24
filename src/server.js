@@ -552,9 +552,16 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
     // (quando listagem da API falha, ainda conseguimos limpar a fila da maquininha)
     const allOrders = await store.listOrders()
     let ordersCleaned = 0
+    let ordersReconciled = 0
     for (const order of allOrders) {
       if (order.paymentIntentId) {
         try {
+          const reconciled = await reconcileOrderByPointIntent(order, 'clear-queue')
+          if (reconciled) {
+            ordersReconciled++
+            continue
+          }
+
           await cancelPointIntent(order.paymentIntentId)
           await store.attachPaymentIntent(order.id, null)
           ordersCleaned++
@@ -564,12 +571,13 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
       }
     }
 
-    console.log(`[clear-queue] concluído: ${intentsDeleted} intents deletados (${intentsFailedToDelete.length} falharam), ${ordersCleaned} pedidos limpos no banco`)
+    console.log(`[clear-queue] concluído: ${intentsDeleted} intents deletados (${intentsFailedToDelete.length} falharam), ${ordersCleaned} pedidos limpos no banco, ${ordersReconciled} pedidos reconciliados`)
     return res.json({
       success: true,
       intentsDeleted,
       intentsFailedToDelete: intentsFailedToDelete.length > 0 ? intentsFailedToDelete : undefined,
       ordersCleaned,
+      ordersReconciled,
       message: intentsFailedToDelete.length > 0 
         ? `${intentsDeleted} intents deletados, mas ${intentsFailedToDelete.length} não conseguiram ser deletados. Tente novamente ou use POST /api/payments/mercadopago/pos/force-reset`
         : 'Fila da maquininha limpa com sucesso',
@@ -657,11 +665,12 @@ app.post('/api/payments/mercadopago/pos/force-sync/:orderId', async (req, res) =
     const payment = intent.payment ?? intent.transactions?.payments?.[0]
     const mpPaymentId = payment?.id ? String(payment.id) : null
     const paymentStatus = payment?.status ?? intent.state
+    const normalizedPaymentStatus = normalizePaymentState(paymentStatus)
 
     console.log(`[force-sync] intent ${order.paymentIntentId}: status=${paymentStatus}, payment_id=${mpPaymentId}`)
 
     // Se pagamento foi aprovado, marca pedido como pago
-    if (paymentStatus === 'FINISHED' || paymentStatus === 'approved') {
+    if (normalizedPaymentStatus === 'approved') {
       const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, 'approved')
       if (mpPaymentId) {
         await store.createPayment({
@@ -683,6 +692,7 @@ app.post('/api/payments/mercadopago/pos/force-sync/:orderId', async (req, res) =
         status: updated.status,
         code: updated.code,
         paymentStatus,
+        normalizedPaymentStatus,
       })
     } else {
       // Se ainda não foi aprovado, apenas retorna o status
@@ -692,6 +702,7 @@ app.post('/api/payments/mercadopago/pos/force-sync/:orderId', async (req, res) =
         orderId,
         currentStatus: order.status,
         paymentStatus,
+        normalizedPaymentStatus,
         hint: 'Tente novamente em alguns segundos',
       })
     }
@@ -785,18 +796,25 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
           try {
             const allOrders = await store.listOrders('aguardando pagamento')
             let cancelledFromDb = 0
+            let reconciledFromDb = 0
             for (const o of allOrders) {
               if (o.paymentIntentId) {
                 try {
+                  const reconciled = await reconcileOrderByPointIntent(o, 'pos/intent-retry')
+                  if (reconciled) {
+                    reconciledFromDb++
+                    continue
+                  }
+
                   await cancelPointIntent(o.paymentIntentId)
+                  await store.attachPaymentIntent(o.id, null)
                   cancelledFromDb++
                 } catch (cancelErr) {
                   console.warn(`[pos/intent] falha ao cancelar intent ${o.paymentIntentId} no device:`, cancelErr?.message)
                 }
-                await store.attachPaymentIntent(o.id, null)
               }
             }
-            console.log(`[pos/intent] intents removidos do banco (${cancelledFromDb} cancelados no device via fallback)`)
+            console.log(`[pos/intent] intents tratados no fallback (${cancelledFromDb} cancelados, ${reconciledFromDb} reconciliados)`)
           } catch (e) {
             console.warn(`[pos/intent] erro ao atualizar banco:`, e?.message)
           }
@@ -853,7 +871,7 @@ app.patch('/api/orders/:id/confirm', async (req, res) => {
 })
 
 function extractNotificationTopicAndResource(source) {
-  const topic =
+  const rawTopic =
     source.query?.topic ||
     source.query?.type ||
     source.body?.type ||
@@ -867,15 +885,58 @@ function extractNotificationTopicAndResource(source) {
     source.body?.id ||
     source.body?.data?.id
 
-  return { topic: String(topic || ''), rawResource: rawResource ? String(rawResource) : null }
+  const topic = String(rawTopic || '').toLowerCase()
+  return { topic, rawResource: rawResource ? String(rawResource) : null }
 }
 
 function normalizePaymentState(status) {
   const normalized = String(status || '').toLowerCase()
-  if (normalized === 'finished' || normalized === 'approved' || normalized === 'authorized') return 'approved'
+  if (normalized === 'finished' || normalized === 'approved' || normalized === 'authorized' || normalized === 'accredited') return 'approved'
   if (normalized === 'rejected' || normalized === 'refunded' || normalized === 'charged_back') return 'rejected'
   if (normalized === 'canceled' || normalized === 'cancelled' || normalized === 'error') return 'cancelled'
   return normalized
+}
+
+async function reconcileOrderByPointIntent(order, sourceTag) {
+  if (!order?.paymentIntentId) return false
+
+  try {
+    const intent = await mpRequest(`/point/integration-api/payment-intents/${order.paymentIntentId}`)
+    const payment = intent.payment ?? intent.transactions?.payments?.[0]
+    const mpPaymentId = payment?.id ? String(payment.id) : null
+    const normalizedStatus = normalizePaymentState(payment?.status ?? intent.state)
+
+    if (normalizedStatus !== 'approved' && normalizedStatus !== 'rejected' && normalizedStatus !== 'cancelled') {
+      return false
+    }
+
+    const freshOrder = await store.getOrder(order.id)
+    if (!freshOrder) return false
+
+    if (freshOrder.status === 'em montagem' || freshOrder.status === 'pronto' || freshOrder.status === 'retirado' || freshOrder.status === 'entregue') {
+      await releasePointQueueForOrder(freshOrder, sourceTag)
+      return true
+    }
+
+    const updated = await store.updateOrderFromPayment(freshOrder.id, mpPaymentId, normalizedStatus)
+    if (normalizedStatus === 'approved' && mpPaymentId) {
+      await store.createPayment({
+        orderId: updated.id,
+        provider: 'mercadopago',
+        status: 'approved',
+        providerRef: mpPaymentId,
+        receiptCode: updated.code,
+      })
+      await clearPosOrder()
+    }
+
+    await releasePointQueueForOrder(freshOrder, sourceTag)
+    console.log(`[${sourceTag}] intent ${order.paymentIntentId} reconciliado com status ${normalizedStatus} para pedido ${freshOrder.id}`)
+    return true
+  } catch (err) {
+    console.warn(`[${sourceTag}] falha ao reconciliar intent ${order.paymentIntentId}:`, err?.payload || err?.message)
+    return false
+  }
 }
 
 async function releasePointQueueForOrder(order, sourceTag) {
@@ -993,18 +1054,23 @@ async function processMercadoPagoNotification(source, sourceTag) {
 
   if (!topic || !resourceId) return
 
-  if (topic === 'payment') {
+  if (topic === 'payment' || topic.startsWith('payment.')) {
     await processPaymentNotification(resourceId, sourceTag)
     return
   }
 
-  if (topic === 'merchant_order') {
+  if (topic === 'merchant_order' || topic.startsWith('merchant_order.')) {
     await processMerchantOrderNotification(resourceId, sourceTag)
     return
   }
 
   // IPN clássico do Point
-  if (topic === 'point_integration_ipn' || topic === 'payment_intent') {
+  if (
+    topic === 'point_integration_ipn' ||
+    topic === 'payment_intent' ||
+    topic.startsWith('point_integration_ipn.') ||
+    topic.startsWith('payment_intent.')
+  ) {
     await processPointIntentNotification(resourceId, sourceTag)
   }
 }
