@@ -1050,62 +1050,37 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     }
 
     let intent
-    let lastError
-    const MAX_RETRIES = 3
-    const INITIAL_DELAY = 500 // ms
+    try {
+      intent = await createIntent()
+    } catch (err) {
+      if (!isQueuedIntentConflict(err)) throw err // não é 409, relança direto
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      // 409 detectado - fila travada. Tenta limpeza rápida UMA VEZ
+      console.warn(`[pos/intent] 409 detectado (fila travada), tentando limpeza rápida...`)
+
       try {
-        intent = await createIntent()
-        break // sucesso, sai do loop
-      } catch (err) {
-        lastError = err
-        if (!isQueuedIntentConflict(err)) throw err // não é 409, relança
-
-        if (attempt < MAX_RETRIES) {
-          console.log(`[pos/intent] tentativa ${attempt}/${MAX_RETRIES}: 409 detectado, limpando intents...`)
-
-          await forceClearDeviceQueue(pointDeviceId, 'pos/intent-retry')
-
-          // Cleanup agressivo em cada retry:
-          // 1. Lista intents da API e deleta todos
-          try {
-            const intentIds = await discoverPointIntentIds(pointDeviceId, 'pos/intent-retry')
-            for (const intentId of intentIds) {
-              if (intentId) {
-                await cancelPointIntent(String(intentId))
-              }
-            }
-            console.log(`[pos/intent] ${intentIds.length} intent(s) deletado(s) da API/fallback`)
-          } catch (e) {
-            console.warn(`[pos/intent] não conseguiu limpar intents via API/fallback:`, {
-              status: e?.status,
-              payload: e?.payload,
-              message: e?.message,
-            })
-          }
-
-          // 2. Cancela intents conhecidos pelo banco e remove vínculo
-          try {
-            const dbCleanup = await cancelKnownIntentsFromDatabase('pos/intent-retry')
-            console.log(`[pos/intent] intents tratados no fallback (${dbCleanup.cancelled} cancelados, ${dbCleanup.reconciled} reconciliados)`)
-          } catch (e) {
-            console.warn(`[pos/intent] erro ao atualizar banco:`, e?.message)
-          }
-
-          // Delay antes da próxima tentativa (exponencial: 500ms, 1s, 2s)
-          const delayMs = INITIAL_DELAY * Math.pow(2, attempt - 1)
-          console.log(`[pos/intent] aguardando ${delayMs}ms antes de tentar novamente...`)
-          await new Promise(resolve => setTimeout(resolve, delayMs))
-        }
+        const dbCleanup = await cancelKnownIntentsFromDatabase('pos/intent-cleanup')
+        console.log(`[pos/intent] limpeza rápida: ${dbCleanup.cancelled} cancelados, ${dbCleanup.reconciled} reconciliados`)
+      } catch (e) {
+        console.warn(`[pos/intent] limpeza rápida falhou:`, e?.message)
       }
-    }
 
-    // Se chegou aqui, intent ainda não foi criado
-    if (!intent) {
-      const msg = `Não conseguiu criar intent após ${MAX_RETRIES} tentativas. A fila da maquininha pode estar travada. Use POST /api/payments/mercadopago/pos/clear-queue`
-      console.error(`[pos/intent] ${msg}`)
-      throw Object.assign(new Error(msg), { status: 503, payload: lastError?.payload })
+      // Tentar UMA VEZ mais
+      try {
+        console.log(`[pos/intent] tentando criar intent novamente...`)
+        intent = await createIntent()
+      } catch (retryErr) {
+        if (isQueuedIntentConflict(retryErr)) {
+          // Se continua 409, não conseguimos resolver via cleanup - sugere clear-queue
+          const msg = `Fila da maquininha travada com intent não identificado. Execute: POST /api/payments/mercadopago/pos/clear-queue`
+          console.error(`[pos/intent] ${msg}`)
+          throw Object.assign(new Error(msg), {
+            status: 503,
+            payload: { ...retryErr?.payload, clearQueueRequired: true }
+          })
+        }
+        throw retryErr
+      }
     }
 
     await store.attachPaymentIntent(order.id, intent.id)
