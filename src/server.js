@@ -1344,9 +1344,17 @@ function startPointIntentWatcher(intentId, orderId) {
       const intentData = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
       
       const payment = intentData.payment ?? intentData.transactions?.payments?.[0]
-      const paymentStatus = payment?.status ?? intentData.state
+      const rawIntentState = intentData.state
+      const paymentStatus = payment?.status ?? rawIntentState
       const state = normalizePaymentState(paymentStatus)
-      console.log(`[intent-watcher] intent ${intentId} (pedido ${orderId}): tentativa ${attempts}/${maxAttempts}, state=${state}`)
+      const paymentId = payment?.id ? String(payment.id) : null
+      
+      // Log com detalhes extras para diagnóstico
+      if (state === 'approved' || rawIntentState === 'finished') {
+        console.log(`[intent-watcher] 🎉 PAGAMENTO APROVADO! intent ${intentId} (pedido ${orderId}): raw_state=${rawIntentState}, payment_id=${paymentId}`)
+      } else {
+        console.log(`[intent-watcher] intent ${intentId} (pedido ${orderId}): tentativa ${attempts}/${maxAttempts}, state=${state}, raw_state=${rawIntentState}`)
+      }
       
       if (state === 'approved') {
         // Pagamento confirmado! Reconcilia e para o monitoramento
