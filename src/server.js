@@ -1696,17 +1696,36 @@ async function processPaymentNotification(paymentId, sourceTag) {
     console.log(`[${sourceTag}] consultando payment ${paymentId}...`)
     const payment = await mpRequest(`/v1/payments/${paymentId}`)
     const mpPaymentId = String(payment.id)
-    const normalizedStatus = normalizePaymentState(payment.status)
+    const providerStatus = (payment.status ?? 'pending').toLowerCase()
+    const normalizedStatus = normalizePaymentState(providerStatus)
     const isPix = payment.payment_method_id === 'pix'
 
     console.log(`[${sourceTag}] payment ${mpPaymentId} status=${normalizedStatus} type=${payment.payment_method_id}`, {
-      created: payment.created_date,
+      created: payment.date_created,
       description: payment.description,
-      hasExternalRef: !!payment.external_reference,
+      external_ref: payment.external_reference,
+      additional_info: JSON.stringify(payment.additional_info),
     })
 
-    let order = await resolveOrderByPaymentFallback(payment)
-    if (!order) order = await resolveOrderByPaymentIdFromIntents(mpPaymentId)
+    // MP Point coloca o external_reference dentro de additional_info
+    let orderId = 
+      payment.external_reference ||
+      payment.additional_info?.external_reference ||
+      payment.metadata?.order_id
+
+    let order = null
+    if (orderId) {
+      order = await store.getOrder(Number(orderId))
+    }
+    
+    if (!order) {
+      order = await resolveOrderByPaymentFallback(payment)
+    }
+    
+    if (!order) {
+      order = await resolveOrderByPaymentIdFromIntents(mpPaymentId)
+    }
+    
     if (!order) {
       // Se for PIX e não tem order vinculado, pode ser PIX avulso (ignorar)
       if (isPix) {
@@ -1841,18 +1860,157 @@ async function processPointIntentNotification(intentId, sourceTag) {
   }
 }
 
+// Handler Point Integration Webhook (formato do exemplo)
+async function handlePointIntegrationWebhook(payload, sourceTag) {
+  // Para pagamentos da maquininha:
+  // 1. Buscar o intent para pegar external_reference e estado
+  // 2. Se houver payment_id, buscar o pagamento para confirmar status
+  const intentId = payload?.data?.id
+  const paymentId = payload?.data?.payment_id
+
+  console.log(
+    `[${sourceTag}] Point webhook. intentId:`,
+    intentId,
+    'paymentId:',
+    paymentId,
+  )
+
+  let orderId = null
+  let providerStatus = 'pending'
+  let externalId = ''
+
+  // Busca o intent para pegar external_reference
+  if (intentId) {
+    try {
+      const intentData = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
+      orderId = intentData?.additional_info?.external_reference
+      console.log(`[${sourceTag}] intent data:`, JSON.stringify({
+        id: intentData.id,
+        state: intentData.state,
+        external_ref: intentData?.additional_info?.external_reference,
+        has_payment: !!intentData.payment,
+      }))
+    } catch (e) {
+      console.error(`[${sourceTag}] Falha ao buscar intent:`, e.message)
+    }
+  }
+
+  // Busca o pagamento se tiver payment_id
+  if (paymentId) {
+    try {
+      const payment = await mpRequest(`/v1/payments/${paymentId}`)
+      providerStatus = (payment.status ?? 'pending').toLowerCase()
+      orderId = orderId || payment.external_reference
+      externalId = String(payment.id ?? paymentId)
+      console.log(
+        `[${sourceTag}] Point payment status:`,
+        providerStatus,
+        'orderId:',
+        orderId,
+      )
+    } catch (e) {
+      console.error(`[${sourceTag}] Falha ao buscar payment:`, e.message)
+      // Derivar status do state do intent
+      const state = String(payload?.data?.state ?? '').toUpperCase()
+      if (state === 'FINISHED') providerStatus = 'approved'
+      else if (state === 'CANCELED' || state === 'CANCELLED')
+        providerStatus = 'cancelled'
+      externalId = String(paymentId ?? intentId ?? '')
+    }
+  } else {
+    // Sem payment_id ainda (intent ainda processando) — derivar do state
+    const state = String(payload?.data?.state ?? '').toUpperCase()
+    if (state === 'FINISHED') providerStatus = 'approved'
+    else if (state === 'CANCELED' || state === 'CANCELLED')
+      providerStatus = 'cancelled'
+    else providerStatus = 'pending'
+    externalId = String(intentId ?? '')
+    console.log(`[${sourceTag}] Point sem payment_id, state:`, state)
+  }
+
+  // Normaliza o status
+  const normalizedStatus = normalizePaymentState(providerStatus)
+
+  if (!orderId) {
+    console.error(`[${sourceTag}] Sem orderId. Payload:`, JSON.stringify(payload))
+    return
+  }
+
+  const order = await store.getOrder(Number(orderId))
+
+  if (!order) {
+    console.error(`[${sourceTag}] Pedido ${orderId} nao encontrado para o webhook Point recebido.`)
+    return
+  }
+
+  // Se já foi processado, ignora
+  if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado' || order.status === 'entregue') {
+    console.log(`[${sourceTag}] webhook Point para pedido ${orderId} já processado (status=${order.status})`)
+    stopPointIntentWatcher(intentId)
+    return
+  }
+
+  // Atualiza o pedido
+  const updated = await store.updateOrderFromPayment(order.id, externalId || null, normalizedStatus)
+
+  if (normalizedStatus === 'approved') {
+    await store.createPayment({
+      orderId: updated.id,
+      provider: 'mercadopago',
+      status: 'approved',
+      providerRef: externalId,
+      receiptCode: updated.code,
+    })
+    console.log(`[${sourceTag}] ✅ Point webhook: pagamento aprovado para pedido ${order.id}`)
+    
+    // Para o watcher
+    stopPointIntentWatcher(intentId)
+    
+    // Limpa fila Point
+    await releasePointQueueForOrder(order, sourceTag)
+    await clearPosOrder()
+  } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
+    console.log(`[${sourceTag}] ❌ Point webhook: pagamento ${normalizedStatus} para pedido ${order.id}`)
+    
+    // Para o watcher
+    stopPointIntentWatcher(intentId)
+    
+    // Limpa fila Point
+    await releasePointQueueForOrder(order, sourceTag)
+  } else {
+    console.log(`[${sourceTag}] ⏳ Point webhook: pagamento pendente para pedido ${order.id}, status=${normalizedStatus}`)
+  }
+}
+
 async function processMercadoPagoNotification(source, sourceTag) {
+  const payload = source.body || {}
   const { topic, rawResource } = extractNotificationTopicAndResource(source)
   const resourceId = rawResource ? rawResource.split('/').pop() : null
 
-  console.log(`[${sourceTag}] recebido topic=${topic} resource=${resourceId}`)
+  console.log(`[${sourceTag}] recebido:`, JSON.stringify({
+    topic,
+    resourceId,
+    type: payload.type,
+    action: payload.action,
+    hasData: !!payload.data,
+  }))
 
-  if (!topic || !resourceId) return
+  // MP sends { type: "payment", data: { id: "<payment_id>" } } — formato novo
+  // MP Point envia { type: "point_integration_wh", data: { id: "<intent_id>", payment_id: 123 } }
+  // MP também pode enviar formato ANTIGO: { resource: "123456", topic: "payment" }
+  const isPointWebhook = payload?.type === "point_integration_wh"
+  const isLegacyWebhook = !!topic && !!resourceId && !payload?.type
+
+  // WEBHOOK POINT (formato novo)
+  if (isPointWebhook) {
+    await handlePointIntegrationWebhook(payload, sourceTag)
+    return
+  }
 
   // API NOVA do Mercado Pago Point (atual)
   // Webhooks de order: order.processed, order.action_required, order.failed, order.canceled, order.refunded, order.expired
   if (topic === 'order.processed' || topic === 'order.action_required' || topic === 'order.failed' || topic === 'order.canceled' || topic === 'order.refunded' || topic === 'order.expired') {
-    await processPointOrderNotification(resourceId, source.body, sourceTag)
+    await processPointOrderNotification(resourceId, payload, sourceTag)
     return
   }
 
