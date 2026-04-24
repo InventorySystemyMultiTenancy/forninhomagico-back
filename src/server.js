@@ -679,6 +679,90 @@ app.get('/api/payments/mercadopago/pos/device-status', async (_req, res) => {
   }
 })
 
+app.get('/api/payments/mercadopago/pos/intent-status/:orderId', async (req, res) => {
+  const orderId = Number(req.params.orderId)
+  if (Number.isNaN(orderId)) return res.status(400).json({ error: 'orderId inválido' })
+
+  try {
+    const order = await store.getOrder(orderId)
+    if (!order) return res.status(404).json({ error: 'Pedido não encontrado' })
+
+    if (!order.paymentIntentId) {
+      return res.json({
+        success: false,
+        message: 'Pedido sem payment intent',
+        orderId,
+        orderStatus: order.status,
+      })
+    }
+
+    console.log(`[polling] consultando intent ${order.paymentIntentId} para pedido ${orderId}`)
+
+    const intent = await mpRequest(`/point/integration-api/payment-intents/${order.paymentIntentId}`)
+    const payment = intent.payment ?? intent.transactions?.payments?.[0]
+    const intentStatus = payment?.status ?? intent.state
+    const normalizedStatus = normalizePaymentState(intentStatus)
+
+    console.log(`[polling] intent ${order.paymentIntentId}: state=${intent.state}, payment.status=${payment?.status}, normalizado=${normalizedStatus}`)
+
+    if (normalizedStatus === 'approved' && order.status === 'aguardando pagamento') {
+      const mpPaymentId = payment?.id ? String(payment.id) : null
+      const updated = await store.updateOrderFromPayment(orderId, mpPaymentId, 'approved')
+      if (mpPaymentId) {
+        await store.createPayment({
+          orderId: updated.id,
+          provider: 'mercadopago',
+          status: 'approved',
+          providerRef: mpPaymentId,
+          receiptCode: updated.code,
+        })
+      }
+      await clearPosOrder()
+      console.log(`[polling] pedido ${orderId} reconciliado como pago (via polling)`)
+      return res.json({
+        success: true,
+        message: 'Pagamento aprovado (detectado via polling)',
+        orderId,
+        orderStatus: 'em montagem',
+        intentStatus,
+        normalizedStatus,
+        paymentId: payment?.id,
+      })
+    }
+
+    if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
+      const updated = await store.updateOrderFromPayment(orderId, null, normalizedStatus)
+      await releasePointQueueForOrder(order, 'polling')
+      return res.json({
+        success: false,
+        message: `Pagamento ${normalizedStatus}`,
+        orderId,
+        orderStatus: updated.status,
+        intentStatus,
+        normalizedStatus,
+      })
+    }
+
+    return res.json({
+      success: false,
+      message: 'Pagamento ainda está sendo processado',
+      orderId,
+      orderStatus: order.status,
+      intentStatus,
+      normalizedStatus,
+    })
+  } catch (err) {
+    return res.status(err.status || 500).json({
+      error: 'Erro ao consultar status do intent',
+      details: {
+        status: err?.status,
+        payload: err?.payload,
+        message: err?.message,
+      },
+    })
+  }
+})
+
 app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
   const { pointDeviceId } = config.mercadoPago
   if (!pointDeviceId) {
@@ -1056,7 +1140,8 @@ function extractNotificationTopicAndResource(source) {
 }
 
 function normalizePaymentState(status) {
-  const normalized = String(status || '').toLowerCase()
+  const normalized = String(status || '').toLowerCase().trim()
+  // FINISHED é o status oficial do Point quando pagamento é completado
   if (normalized === 'finished' || normalized === 'approved' || normalized === 'authorized' || normalized === 'accredited') return 'approved'
   if (normalized === 'rejected' || normalized === 'refunded' || normalized === 'charged_back') return 'rejected'
   if (normalized === 'canceled' || normalized === 'cancelled' || normalized === 'error') return 'cancelled'
@@ -1180,35 +1265,53 @@ async function processMerchantOrderNotification(merchantOrderId, sourceTag) {
 }
 
 async function processPointIntentNotification(intentId, sourceTag) {
-  const intent = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
-  const payment = intent.payment ?? intent.transactions?.payments?.[0]
-  const mpPaymentId = payment?.id ? String(payment.id) : null
-  const normalizedStatus = normalizePaymentState(payment?.status ?? intent.state)
+  try {
+    const intent = await mpRequest(`/point/integration-api/payment-intents/${intentId}`)
+    const payment = intent.payment ?? intent.transactions?.payments?.[0]
+    const mpPaymentId = payment?.id ? String(payment.id) : null
+    const intentState = payment?.status ?? intent.state
+    const normalizedStatus = normalizePaymentState(intentState)
 
-  const resolvedOrderId = Number(intent.additional_info?.external_reference ?? intent.external_reference)
-  let order = null
-  if (!Number.isNaN(resolvedOrderId)) order = await store.getOrder(resolvedOrderId)
-  if (!order) order = await store.findOrderByPaymentIntentId(String(intentId))
-  if (!order) {
-    console.warn(`[${sourceTag}] intent ${intentId} sem pedido correspondente`)
-    return
-  }
+    console.log(`[${sourceTag}] processando intent ${intentId}: state=${intent.state}, payment.status=${payment?.status}, normalizado=${normalizedStatus}`)
 
-  const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, normalizedStatus)
-  if (normalizedStatus === 'approved' && mpPaymentId) {
-    await store.createPayment({
-      orderId: updated.id,
-      provider: 'mercadopago',
-      status: 'approved',
-      providerRef: mpPaymentId,
-      receiptCode: updated.code,
+    const resolvedOrderId = Number(intent.additional_info?.external_reference ?? intent.external_reference)
+    let order = null
+    if (!Number.isNaN(resolvedOrderId)) order = await store.getOrder(resolvedOrderId)
+    if (!order) order = await store.findOrderByPaymentIntentId(String(intentId))
+    if (!order) {
+      console.warn(`[${sourceTag}] intent ${intentId} sem pedido correspondente`)
+      return
+    }
+
+    if (order.status !== 'aguardando pagamento') {
+      console.log(`[${sourceTag}] intent ${intentId} para pedido ${order.id} que já está em status ${order.status}, ignorando`)
+      return
+    }
+
+    const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, normalizedStatus)
+    if (normalizedStatus === 'approved' && mpPaymentId) {
+      await store.createPayment({
+        orderId: updated.id,
+        provider: 'mercadopago',
+        status: 'approved',
+        providerRef: mpPaymentId,
+        receiptCode: updated.code,
+      })
+      console.log(`[${sourceTag}] ✅ point_intent ${intentId} APROVADO para pedido ${order.id}`)
+      await releasePointQueueForOrder(order, sourceTag)
+      await clearPosOrder()
+    } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
+      console.log(`[${sourceTag}] ❌ point_intent ${intentId} ${normalizedStatus.toUpperCase()} para pedido ${order.id}`)
+      await releasePointQueueForOrder(order, sourceTag)
+    } else {
+      console.log(`[${sourceTag}] ⏳ point_intent ${intentId} status ${normalizedStatus} para pedido ${order.id}, aguardando...`)
+    }
+  } catch (err) {
+    console.error(`[${sourceTag}] erro ao processar intent ${intentId}:`, {
+      status: err?.status,
+      payload: err?.payload,
+      message: err?.message,
     })
-    console.log(`[${sourceTag}] point_intent ${intentId} aprovado para pedido ${order.id}`)
-    await releasePointQueueForOrder(order, sourceTag)
-    await clearPosOrder()
-  } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
-    console.log(`[${sourceTag}] point_intent ${intentId} finalizado com status ${normalizedStatus} para pedido ${order.id}`)
-    await releasePointQueueForOrder(order, sourceTag)
   }
 }
 
