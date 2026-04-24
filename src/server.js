@@ -1224,6 +1224,65 @@ app.post('/api/payments/mercadopago/pix/create', async (req, res) => {
   }
 })
 
+// Recuperar QR Code PIX de um pedido existente
+app.get('/api/payments/mercadopago/pix/qrcode/:orderId', async (req, res) => {
+  const orderId = Number(req.params.orderId)
+  
+  if (Number.isNaN(orderId)) {
+    return res.status(400).json({ error: 'orderId inválido' })
+  }
+
+  try {
+    const order = await store.getOrder(orderId)
+    if (!order) return res.status(404).json({ error: 'Pedido não encontrado' })
+    
+    if (order.paymentMethod !== 'pix') {
+      return res.status(400).json({ error: 'Pedido não é do tipo PIX' })
+    }
+    
+    if (!order.paymentIntentId) {
+      return res.status(404).json({ error: 'QR Code PIX ainda não foi gerado para este pedido' })
+    }
+    
+    // Se já foi pago, retorna sucesso sem QR Code
+    if (order.status !== 'aguardando pagamento') {
+      return res.json({
+        success: true,
+        paid: true,
+        orderId: order.id,
+        status: order.status,
+        message: 'Pedido já foi pago'
+      })
+    }
+
+    // Busca o pagamento na API do Mercado Pago
+    const payment = await mpRequest(`/v1/payments/${order.paymentIntentId}`)
+    
+    const qrCode = payment.point_of_interaction?.transaction_data?.qr_code
+    const qrCodeBase64 = payment.point_of_interaction?.transaction_data?.qr_code_base64
+    
+    if (!qrCode) {
+      return res.status(404).json({ error: 'QR Code não disponível (pode ter expirado)' })
+    }
+
+    console.log(`[pix/qrcode] QR Code recuperado para pedido ${orderId}, payment_id=${payment.id}`)
+    
+    return res.json({
+      success: true,
+      paid: false,
+      paymentId: payment.id,
+      orderId: order.id,
+      totalCents: order.totalCents,
+      qrCode,
+      qrCodeBase64,
+      status: payment.status,
+    })
+  } catch (err) {
+    console.error('[pix/qrcode] erro:', err)
+    return res.status(err.status || 500).json({ error: err.payload || err.message })
+  }
+})
+
 // Confirmação manual de pagamento (atendente clica após receber na maquininha)
 app.patch('/api/orders/:id/confirm', async (req, res) => {
   const orderId = Number(req.params.id)
