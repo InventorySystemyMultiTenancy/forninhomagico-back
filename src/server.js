@@ -76,6 +76,9 @@ const paymentIntentSchema = z.object({
   orderId: z.number().int(),
 })
 
+// Map de watchers de intent Point ativos: intentId -> intervalId
+const pointIntentWatchers = new Map()
+
 async function mpRequest(path, options = {}) {
   if (!config.mercadoPago.accessToken) {
     throw new Error('Mercado Pago access token not configured')
@@ -1123,6 +1126,9 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     }
 
     await store.attachPaymentIntent(order.id, intent.id)
+    
+    // Inicia monitoramento automático do intent
+    startPointIntentWatcher(intent.id, order.id)
 
     console.log(`[pos/intent] intent ${intent.id} criado para pedido ${order.id}, R$${(order.totalCents/100).toFixed(2)}`)
     return res.json({ success: true, intentId: intent.id, orderId: order.id, totalCents: order.totalCents })
@@ -1292,6 +1298,74 @@ async function reconcileOrderByPointIntent(order, sourceTag) {
     console.warn(`[${sourceTag}] falha ao reconciliar intent ${order.paymentIntentId}:`, err?.payload || err?.message)
     return false
   }
+}
+
+/**
+ * Para o monitoramento de um intent Point
+ */
+function stopPointIntentWatcher(intentId) {
+  if (!intentId) return
+  const intervalId = pointIntentWatchers.get(intentId)
+  if (intervalId) {
+    clearInterval(intervalId)
+    pointIntentWatchers.delete(intentId)
+    console.log(`[intent-watcher] parou monitoramento do intent ${intentId}`)
+  }
+}
+
+/**
+ * Inicia monitoramento em background de um intent Point
+ */
+function startPointIntentWatcher(intentId, orderId) {
+  if (!intentId || !orderId) return
+  
+  // Remove watcher anterior, se existir
+  stopPointIntentWatcher(intentId)
+  
+  let attempts = 0
+  const maxAttempts = 120 // 6 minutos (120 * 3s)
+  
+  const intervalId = setInterval(async () => {
+    attempts++
+    
+    try {
+      // Busca status do intent
+      const intentData = await mpRequest(`/point/integration-api/devices/${config.mercadoPago.deviceId}/payment-intents/${intentId}`, {
+        method: 'GET',
+      })
+      
+      const state = normalizePaymentState(intentData.state)
+      console.log(`[intent-watcher] intent ${intentId} (pedido ${orderId}): tentativa ${attempts}/${maxAttempts}, state=${state}`)
+      
+      if (state === 'approved') {
+        // Pagamento confirmado! Reconcilia e para o monitoramento
+        stopPointIntentWatcher(intentId)
+        
+        const order = await store.getOrder(orderId)
+        if (order?.paymentIntentId === intentId) {
+          console.log(`[intent-watcher] pagamento aprovado detectado via polling para pedido ${orderId}`)
+          await reconcileOrderViaIntent(order, 'intent-watcher-polling')
+        }
+      } else if (state === 'rejected' || state === 'cancelled') {
+        // Pagamento rejeitado/cancelado - para o monitoramento
+        stopPointIntentWatcher(intentId)
+        console.log(`[intent-watcher] intent ${intentId} finalizado com state=${state}, parando monitoramento`)
+      } else if (attempts >= maxAttempts) {
+        // Timeout - para o monitoramento
+        stopPointIntentWatcher(intentId)
+        console.log(`[intent-watcher] intent ${intentId} timeout após ${attempts} tentativas`)
+      }
+    } catch (err) {
+      console.warn(`[intent-watcher] erro ao verificar intent ${intentId}:`, err?.message || err)
+      
+      if (attempts >= maxAttempts) {
+        stopPointIntentWatcher(intentId)
+      }
+    }
+  }, 3000) // Verifica a cada 3 segundos
+  
+  pointIntentWatchers.set(intentId, intervalId)
+  console.log(`[intent-watcher] iniciou monitoramento do intent ${intentId} para pedido ${orderId}`)
 }
 
 async function releasePointQueueForOrder(order, sourceTag) {
