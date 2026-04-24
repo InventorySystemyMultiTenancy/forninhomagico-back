@@ -1153,6 +1153,69 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
   }
 })
 
+// Criar Preference (Checkout Web do Mercado Pago)
+app.post('/api/payments/mercadopago/preference', async (req, res) => {
+  const parsed = paymentIntentSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  try {
+    const order = await store.getOrder(parsed.data.orderId)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    
+    if (order.status !== 'aguardando pagamento') {
+      return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
+    }
+
+    // URL do frontend (deve ser configurada em .env)
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
+
+    // Cria a preference do Mercado Pago
+    const preferenceBody = {
+      items: [
+        {
+          id: String(order.id),
+          title: 'Pedido Forninho Mágico',
+          description: `Pedido #${order.id}${order.customerName ? ` - ${order.customerName}` : ''}`,
+          quantity: 1,
+          unit_price: parseFloat((order.totalCents / 100).toFixed(2)),
+          currency_id: 'BRL',
+        },
+      ],
+      external_reference: String(order.id),
+      back_urls: {
+        success: `${frontendUrl}/checkout/retorno`,
+        failure: `${frontendUrl}/checkout/retorno`,
+        pending: `${frontendUrl}/checkout/retorno`,
+      },
+      auto_return: 'approved',
+      notification_url: config.serverUrl ? `${config.serverUrl}/api/notifications/mercadopago` : undefined,
+      statement_descriptor: 'FORNINHO MAGICO',
+    }
+
+    const preference = await mpRequest('/checkout/preferences', {
+      method: 'POST',
+      body: JSON.stringify(preferenceBody),
+    })
+
+    // Salva preference ID no pedido
+    await store.attachPaymentIntent(order.id, String(preference.id))
+
+    console.log(`[preference] Preference ${preference.id} criada para pedido ${order.id}, R$${(order.totalCents/100).toFixed(2)}`)
+    
+    return res.json({
+      success: true,
+      preferenceId: preference.id,
+      initPoint: preference.init_point,
+      sandboxInitPoint: preference.sandbox_init_point,
+      orderId: order.id,
+      totalCents: order.totalCents,
+    })
+  } catch (err) {
+    console.error('[preference] erro:', err)
+    return res.status(err.status || 500).json({ error: err.payload || err.message })
+  }
+})
+
 // Gerar QR Code PIX
 app.post('/api/payments/mercadopago/pix/create', async (req, res) => {
   const parsed = paymentIntentSchema.safeParse(req.body)
