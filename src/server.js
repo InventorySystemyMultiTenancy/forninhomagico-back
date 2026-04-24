@@ -79,6 +79,9 @@ const paymentIntentSchema = z.object({
 // Map de watchers de intent Point ativos: intentId -> intervalId
 const pointIntentWatchers = new Map()
 
+// Map de watchers de pagamento PIX ativos: paymentId -> intervalId
+const pixPaymentWatchers = new Map()
+
 async function mpRequest(path, options = {}) {
   if (!config.mercadoPago.accessToken) {
     throw new Error('Mercado Pago access token not configured')
@@ -1149,6 +1152,74 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
   }
 })
 
+// Gerar QR Code PIX
+app.post('/api/payments/mercadopago/pix/create', async (req, res) => {
+  const parsed = paymentIntentSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() })
+
+  try {
+    const order = await store.getOrder(parsed.data.orderId)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    
+    if (order.paymentMethod !== 'pix') {
+      return res.status(400).json({
+        error: `Pedido ${order.id} está com método ${order.paymentMethod}. QR Code PIX só pode ser criado para pedidos com paymentMethod=pix.`,
+      })
+    }
+    
+    if (order.status !== 'aguardando pagamento') {
+      return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
+    }
+
+    // Cria pagamento PIX
+    const pixPaymentBody = {
+      transaction_amount: order.totalCents / 100,
+      description: `Pedido #${order.id} - Forninho Magico`,
+      payment_method_id: 'pix',
+      external_reference: String(order.id),
+      notification_url: config.serverUrl ? `${config.serverUrl}/api/notifications/mercadopago` : undefined,
+      payer: {
+        email: 'cliente@forninho.com.br',
+        first_name: order.customerName || 'Cliente',
+      },
+    }
+
+    const payment = await mpRequest('/v1/payments', {
+      method: 'POST',
+      body: JSON.stringify(pixPaymentBody),
+    })
+
+    const qrCode = payment.point_of_interaction?.transaction_data?.qr_code
+    const qrCodeBase64 = payment.point_of_interaction?.transaction_data?.qr_code_base64
+    const paymentId = payment.id
+
+    if (!qrCode || !paymentId) {
+      throw new Error('QR Code PIX não retornado pela API')
+    }
+
+    // Salva payment ID no pedido (reutilizando campo paymentIntentId)
+    await store.attachPaymentIntent(order.id, String(paymentId))
+    
+    // Inicia monitoramento automático do pagamento PIX
+    startPixPaymentWatcher(String(paymentId), order.id)
+
+    console.log(`[pix/create] QR Code criado para pedido ${order.id}, payment_id=${paymentId}, R$${(order.totalCents/100).toFixed(2)}`)
+    
+    return res.json({
+      success: true,
+      paymentId,
+      orderId: order.id,
+      totalCents: order.totalCents,
+      qrCode,
+      qrCodeBase64,
+      expiresIn: 1800, // 30 minutos (padrão Mercado Pago)
+    })
+  } catch (err) {
+    console.error('[pix/create] erro:', err)
+    return res.status(err.status || 500).json({ error: err.payload || err.message })
+  }
+})
+
 // Confirmação manual de pagamento (atendente clica após receber na maquininha)
 app.patch('/api/orders/:id/confirm', async (req, res) => {
   const orderId = Number(req.params.id)
@@ -1387,6 +1458,86 @@ function startPointIntentWatcher(intentId, orderId) {
   console.log(`[intent-watcher] iniciou monitoramento do intent ${intentId} para pedido ${orderId}`)
 }
 
+/**
+ * Para o monitoramento de um pagamento PIX
+ */
+function stopPixPaymentWatcher(paymentId) {
+  if (!paymentId) return
+  const intervalId = pixPaymentWatchers.get(paymentId)
+  if (intervalId) {
+    clearInterval(intervalId)
+    pixPaymentWatchers.delete(paymentId)
+    console.log(`[pix-watcher] parou monitoramento do payment ${paymentId}`)
+  }
+}
+
+/**
+ * Inicia monitoramento em background de um pagamento PIX
+ */
+function startPixPaymentWatcher(paymentId, orderId) {
+  if (!paymentId || !orderId) return
+  
+  // Remove watcher anterior, se existir
+  stopPixPaymentWatcher(paymentId)
+  
+  let attempts = 0
+  const maxAttempts = 120 // 6 minutos (120 * 3s)
+  
+  const intervalId = setInterval(async () => {
+    attempts++
+    
+    try {
+      // Busca status do pagamento PIX
+      const paymentData = await mpRequest(`/v1/payments/${paymentId}`)
+      
+      const status = String(paymentData.status || '').toLowerCase()
+      const normalizedStatus = normalizePaymentState(status)
+      
+      // Log com detalhes
+      if (normalizedStatus === 'approved') {
+        console.log(`[pix-watcher] 🎉 PAGAMENTO PIX APROVADO! payment ${paymentId} (pedido ${orderId})`)
+      } else {
+        console.log(`[pix-watcher] payment ${paymentId} (pedido ${orderId}): tentativa ${attempts}/${maxAttempts}, status=${status}`)
+      }
+      
+      if (normalizedStatus === 'approved') {
+        // Pagamento confirmado! Para o monitoramento e atualiza pedido
+        stopPixPaymentWatcher(paymentId)
+        
+        const order = await store.getOrder(orderId)
+        if (order && order.status === 'aguardando pagamento') {
+          console.log(`[pix-watcher] atualizando pedido ${orderId} para pago`)
+          const updated = await store.updateOrderFromPayment(orderId, String(paymentId), 'approved')
+          await store.createPayment({
+            orderId: updated.id,
+            provider: 'mercadopago',
+            status: 'approved',
+            providerRef: String(paymentId),
+            receiptCode: updated.code,
+          })
+        }
+      } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
+        // Pagamento rejeitado/cancelado - para o monitoramento
+        stopPixPaymentWatcher(paymentId)
+        console.log(`[pix-watcher] payment ${paymentId} finalizado com status=${normalizedStatus}`)
+      } else if (attempts >= maxAttempts) {
+        // Timeout - para o monitoramento
+        stopPixPaymentWatcher(paymentId)
+        console.log(`[pix-watcher] payment ${paymentId} timeout após ${attempts} tentativas`)
+      }
+    } catch (err) {
+      console.warn(`[pix-watcher] erro ao verificar payment ${paymentId}:`, err?.message || err)
+      
+      if (attempts >= maxAttempts) {
+        stopPixPaymentWatcher(paymentId)
+      }
+    }
+  }, 3000) // Verifica a cada 3 segundos
+  
+  pixPaymentWatchers.set(paymentId, intervalId)
+  console.log(`[pix-watcher] iniciou monitoramento do payment ${paymentId} para pedido ${orderId}`)
+}
+
 async function releasePointQueueForOrder(order, sourceTag) {
   if (!order?.paymentIntentId) return
   try {
@@ -1407,8 +1558,9 @@ async function processPaymentNotification(paymentId, sourceTag) {
     const payment = await mpRequest(`/v1/payments/${paymentId}`)
     const mpPaymentId = String(payment.id)
     const normalizedStatus = normalizePaymentState(payment.status)
+    const isPix = payment.payment_method_id === 'pix'
 
-    console.log(`[${sourceTag}] payment ${mpPaymentId} status=${normalizedStatus}`, {
+    console.log(`[${sourceTag}] payment ${mpPaymentId} status=${normalizedStatus} type=${payment.payment_method_id}`, {
       created: payment.created_date,
       description: payment.description,
       hasExternalRef: !!payment.external_reference,
@@ -1417,6 +1569,12 @@ async function processPaymentNotification(paymentId, sourceTag) {
     let order = await resolveOrderByPaymentFallback(payment)
     if (!order) order = await resolveOrderByPaymentIdFromIntents(mpPaymentId)
     if (!order) {
+      // Se for PIX e não tem order vinculado, pode ser PIX avulso (ignorar)
+      if (isPix) {
+        console.log(`[${sourceTag}] payment PIX ${mpPaymentId} ignorado: sem vínculo com pedido local`)
+        return
+      }
+      // Se for Point e não tem vinculo, tenta detectar se é PIX mascarado
       if (isLikelyNonPointPayment(payment)) {
         console.log(`[${sourceTag}] payment ${mpPaymentId} ignorado: parece ser PIX/não-Point e não tem vínculo com pedido local`)
         return
@@ -1427,6 +1585,8 @@ async function processPaymentNotification(paymentId, sourceTag) {
 
     if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado' || order.status === 'entregue') {
       console.log(`[${sourceTag}] payment ${mpPaymentId} já processado (order ${order.id} status=${order.status})`)
+      // Para o watcher se existir (PIX ou Point)
+      stopPixPaymentWatcher(mpPaymentId)
       return
     }
 
@@ -1440,11 +1600,25 @@ async function processPaymentNotification(paymentId, sourceTag) {
         receiptCode: updated.code,
       })
       console.log(`[${sourceTag}] ✅ payment ${mpPaymentId} aprovado para pedido ${order.id}`)
-      await releasePointQueueForOrder(order, sourceTag)
-      await clearPosOrder()
+      
+      // Para o watcher PIX se existir
+      stopPixPaymentWatcher(mpPaymentId)
+      
+      // Limpa fila Point se for pagamento Point
+      if (!isPix) {
+        await releasePointQueueForOrder(order, sourceTag)
+        await clearPosOrder()
+      }
     } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
       console.log(`[${sourceTag}] ❌ payment ${mpPaymentId} finalizou com status ${normalizedStatus} para pedido ${order.id}`)
-      await releasePointQueueForOrder(order, sourceTag)
+      
+      // Para o watcher PIX se existir
+      stopPixPaymentWatcher(mpPaymentId)
+      
+      // Limpa fila Point se for pagamento Point
+      if (!isPix) {
+        await releasePointQueueForOrder(order, sourceTag)
+      }
     }
   } catch (err) {
     console.error(`[${sourceTag}] erro ao processar payment:`, err?.message || err)
