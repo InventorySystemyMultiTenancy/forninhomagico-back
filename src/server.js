@@ -444,6 +444,8 @@ async function cancelPointIntent(intentId) {
       console.log(`[pos] intent ${intentId} não pode ser deletada (404/405 - pode ser legada ou já deletada)`, {
         status: err?.status,
       })
+      // Para o watcher deste intent, se existir
+      stopPointIntentWatcher(intentId)
       return
     }
     throw err // relança outros erros (error de conexão, etc)
@@ -1048,12 +1050,21 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     // Comportamento solicitado: sempre substituir intent anterior por uma nova tentativa.
     if (order.paymentIntentId) {
       console.log(`[pos/intent] pedido ${order.id} já tinha intent ${order.paymentIntentId}; cancelando antes de criar nova`)
+      // Para o watcher deste intent ANTES de tentar cancelar
+      stopPointIntentWatcher(order.paymentIntentId)
       try {
         await cancelPointIntent(order.paymentIntentId)
       } catch (err) {
         console.warn(`[pos/intent] não foi possível cancelar intent antiga ${order.paymentIntentId}:`, err?.message)
       }
       await store.attachPaymentIntent(order.id, null)
+    }
+
+    // Para TODOS os watchers órfãos antes de criar novo intent
+    if (pointIntentWatchers.size > 0) {
+      console.log(`[pos/intent-preflight] parando ${pointIntentWatchers.size} watcher(s) órfão(s)...`)
+      const watcherIds = Array.from(pointIntentWatchers.keys())
+      watcherIds.forEach(id => stopPointIntentWatcher(id))
     }
 
     // Limpeza preventiva da fila no device antes da criação (best effort)
