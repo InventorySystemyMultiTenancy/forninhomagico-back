@@ -142,10 +142,22 @@ function resolveOrderIdFromPayment(payment) {
 }
 
 async function resolveOrderByPaymentFallback(payment) {
+  const paymentDebug = {
+    id: payment?.id,
+    external_reference: payment?.external_reference,
+    metadata: payment?.metadata,
+    additional_info: payment?.additional_info,
+    description: payment?.description,
+  }
+  console.log('[webhook] tentando resolver order de payment com:', JSON.stringify(paymentDebug))
+  
   const directOrderId = resolveOrderIdFromPayment(payment)
   if (!Number.isNaN(directOrderId)) {
     const order = await store.getOrder(directOrderId)
-    if (order) return order
+    if (order) {
+      console.log(`[webhook] order ${directOrderId} resolvida via external_reference`)
+      return order
+    }
   }
 
   const merchantOrderId = payment?.order?.id
@@ -155,17 +167,22 @@ async function resolveOrderByPaymentFallback(payment) {
       const moOrderId = Number(mo.external_reference)
       if (!Number.isNaN(moOrderId)) {
         const order = await store.getOrder(moOrderId)
-        if (order) return order
+        if (order) {
+          console.log(`[webhook] order ${moOrderId} resolvida via merchant_order`)
+          return order
+        }
       }
     } catch (err) {
       console.warn('[webhook] falha ao resolver merchant_order:', err?.payload || err?.message)
     }
   }
 
+  console.warn('[webhook] não foi possível resolver order de payment (nenhuma estratégia funcionou)')
   return null
 }
 
 async function resolveOrderByPaymentIdFromIntents(paymentId) {
+  console.log(`[webhook] tentando resolver order de payment ${paymentId} via intents...`)
   const orders = await store.listOrders()
   const candidates = orders.filter((order) => {
     if (!order.paymentIntentId) return false
@@ -174,6 +191,8 @@ async function resolveOrderByPaymentIdFromIntents(paymentId) {
     return true
   })
 
+  console.log(`[webhook] ${candidates.length} intents candidatas para consultar`)
+  
   for (const order of candidates) {
     try {
       const intent = await mpRequest(`/point/integration-api/payment-intents/${order.paymentIntentId}`)
@@ -184,15 +203,17 @@ async function resolveOrderByPaymentIdFromIntents(paymentId) {
           if (p?.id) intentPayments.push(String(p.id))
         }
       }
-
+      
       if (intentPayments.includes(String(paymentId))) {
+        console.log(`[webhook] payment ${paymentId} encontrado em intent de order ${order.id}`)
         return order
       }
     } catch (err) {
-      console.warn(`[webhook] falha ao consultar intent ${order.paymentIntentId}:`, err?.payload || err?.message)
+      console.warn(`[webhook] falha ao consultar intent ${order.paymentIntentId}:`, err?.payload?.error || err?.message)
     }
   }
 
+  console.warn(`[webhook] payment ${paymentId} não encontrado em nenhuma intent`)
   return null
 }
 
@@ -414,12 +435,15 @@ async function cancelPointIntent(intentId) {
     )
     console.log(`[pos] intent ${intentId} cancelado`)
   } catch (err) {
-    // Não falha se intent não existe na API (pode ter já sido deletado)
-    if (err?.status === 404) {
-      console.log(`[pos] intent ${intentId} já não existe`)
+    // Não falha se intent não existe ou operação não suportada
+    // (pode ter já sido deletado, ou ser uma intent legada)
+    if (err?.status === 404 || err?.status === 405) {
+      console.log(`[pos] intent ${intentId} não pode ser deletada (404/405 - pode ser legada ou já deletada)`, {
+        status: err?.status,
+      })
       return
     }
-    throw err // relança outros erros
+    throw err // relança outros erros (error de conexão, etc)
   }
 }
 
@@ -567,8 +591,20 @@ app.delete('/api/orders/:id', async (req, res) => {
   try {
     const order = await store.getOrder(orderId)
     if (!order) return res.status(404).json({ error: 'Order not found' })
-    // Cancela intent na maquininha antes de cancelar o pedido
-    if (order.paymentIntentId) await cancelPointIntent(order.paymentIntentId)
+    
+    // Tenta cancelar intent na maquininha, mas não bloqueia a deleção se falhar
+    if (order.paymentIntentId) {
+      try {
+        await cancelPointIntent(order.paymentIntentId)
+      } catch (err) {
+        // Log como warning, mas continua com a deleção local
+        console.warn(
+          `[DELETE /api/orders/:id] aviso: não conseguiu cancelar intent ${order.paymentIntentId}:`,
+          err?.message || err,
+        )
+      }
+    }
+    
     await clearPosOrder()
     const result = await store.cancelOrder(orderId)
     if (!result) return res.status(404).json({ error: 'Order not found' })
@@ -1248,36 +1284,48 @@ async function releasePointQueueForOrder(order, sourceTag) {
 }
 
 async function processPaymentNotification(paymentId, sourceTag) {
-  const payment = await mpRequest(`/v1/payments/${paymentId}`)
-  const mpPaymentId = String(payment.id)
-  const normalizedStatus = normalizePaymentState(payment.status)
+  try {
+    console.log(`[${sourceTag}] consultando payment ${paymentId}...`)
+    const payment = await mpRequest(`/v1/payments/${paymentId}`)
+    const mpPaymentId = String(payment.id)
+    const normalizedStatus = normalizePaymentState(payment.status)
 
-  let order = await resolveOrderByPaymentFallback(payment)
-  if (!order) order = await resolveOrderByPaymentIdFromIntents(mpPaymentId)
-  if (!order) {
-    console.warn(`[${sourceTag}] payment ${mpPaymentId} sem pedido correspondente`)
-    return
-  }
-
-  if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado' || order.status === 'entregue') {
-    return
-  }
-
-  const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, normalizedStatus)
-  if (normalizedStatus === 'approved') {
-    await store.createPayment({
-      orderId: updated.id,
-      provider: 'mercadopago',
-      status: 'approved',
-      providerRef: mpPaymentId,
-      receiptCode: updated.code,
+    console.log(`[${sourceTag}] payment ${mpPaymentId} status=${normalizedStatus}`, {
+      created: payment.created_date,
+      description: payment.description,
+      hasExternalRef: !!payment.external_reference,
     })
-    console.log(`[${sourceTag}] payment ${mpPaymentId} aprovado para pedido ${order.id}`)
-    await releasePointQueueForOrder(order, sourceTag)
-    await clearPosOrder()
-  } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
-    console.log(`[${sourceTag}] payment ${mpPaymentId} finalizou com status ${normalizedStatus} para pedido ${order.id}`)
-    await releasePointQueueForOrder(order, sourceTag)
+
+    let order = await resolveOrderByPaymentFallback(payment)
+    if (!order) order = await resolveOrderByPaymentIdFromIntents(mpPaymentId)
+    if (!order) {
+      console.warn(`[${sourceTag}] payment ${mpPaymentId} sem pedido correspondente (debug: nenhuma estratégia em resolveOrderBy* funcionou)`)
+      return
+    }
+
+    if (order.status === 'em montagem' || order.status === 'pronto' || order.status === 'retirado' || order.status === 'entregue') {
+      console.log(`[${sourceTag}] payment ${mpPaymentId} já processado (order ${order.id} status=${order.status})`)
+      return
+    }
+
+    const updated = await store.updateOrderFromPayment(order.id, mpPaymentId, normalizedStatus)
+    if (normalizedStatus === 'approved') {
+      await store.createPayment({
+        orderId: updated.id,
+        provider: 'mercadopago',
+        status: 'approved',
+        providerRef: mpPaymentId,
+        receiptCode: updated.code,
+      })
+      console.log(`[${sourceTag}] ✅ payment ${mpPaymentId} aprovado para pedido ${order.id}`)
+      await releasePointQueueForOrder(order, sourceTag)
+      await clearPosOrder()
+    } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
+      console.log(`[${sourceTag}] ❌ payment ${mpPaymentId} finalizou com status ${normalizedStatus} para pedido ${order.id}`)
+      await releasePointQueueForOrder(order, sourceTag)
+    }
+  } catch (err) {
+    console.error(`[${sourceTag}] erro ao processar payment:`, err?.message || err)
   }
 }
 
