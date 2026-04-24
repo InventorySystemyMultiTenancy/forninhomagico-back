@@ -426,6 +426,96 @@ function isQueuedIntentConflict(err) {
   return err?.status === 409 && String(err?.payload?.error || '') === '2205'
 }
 
+function collectIntentIdsFromUnknown(source, out = new Set()) {
+  if (!source) return out
+
+  if (Array.isArray(source)) {
+    for (const item of source) collectIntentIdsFromUnknown(item, out)
+    return out
+  }
+
+  if (typeof source !== 'object') return out
+
+  const addMaybeIntentId = (value) => {
+    if (typeof value === 'number' || typeof value === 'string') {
+      const str = String(value).trim()
+      if (str && str !== 'null' && str !== 'undefined') out.add(str)
+    }
+  }
+
+  for (const [key, value] of Object.entries(source)) {
+    const normalizedKey = key.toLowerCase()
+    const looksLikeIntentField =
+      normalizedKey.includes('payment_intent') ||
+      normalizedKey.includes('paymentintent') ||
+      normalizedKey === 'intent' ||
+      normalizedKey === 'intentid' ||
+      normalizedKey === 'intent_id'
+
+    if (looksLikeIntentField) {
+      if (value && typeof value === 'object') {
+        addMaybeIntentId(value.id)
+      } else {
+        addMaybeIntentId(value)
+      }
+    }
+
+    if (value && typeof value === 'object') {
+      collectIntentIdsFromUnknown(value, out)
+    }
+  }
+
+  return out
+}
+
+function parseIntentIdsFromListResponse(response) {
+  const intents = Array.isArray(response)
+    ? response
+    : (Array.isArray(response?.results) ? response.results : (Array.isArray(response?.events) ? response.events : []))
+
+  const ids = []
+  for (const item of intents) {
+    const id = item?.id || item?.payment_intent_id || item?.paymentIntentId
+    if (id) ids.push(String(id))
+  }
+  return ids
+}
+
+async function discoverPointIntentIds(pointDeviceId, sourceTag) {
+  const ids = new Set()
+
+  try {
+    const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
+    for (const id of parseIntentIdsFromListResponse(response)) ids.add(id)
+  } catch (err) {
+    console.warn(`[${sourceTag}] falha ao listar intents por devices/:id/payment-intents:`, {
+      status: err?.status,
+      payload: err?.payload,
+      message: err?.message,
+    })
+  }
+
+  if (ids.size > 0) return Array.from(ids)
+
+  // Fallback: alguns ambientes retornam apenas estado/intent atual via endpoint de device.
+  try {
+    const device = await mpRequest(`/point/integration-api/devices/${pointDeviceId}`)
+    const discovered = collectIntentIdsFromUnknown(device)
+    for (const id of discovered) ids.add(id)
+    if (ids.size > 0) {
+      console.log(`[${sourceTag}] intents descobertos via endpoint de device: ${Array.from(ids).join(', ')}`)
+    }
+  } catch (err) {
+    console.warn(`[${sourceTag}] falha ao consultar status do device para descobrir intents:`, {
+      status: err?.status,
+      payload: err?.payload,
+      message: err?.message,
+    })
+  }
+
+  return Array.from(ids)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/orders/:id', async (req, res) => {
@@ -509,6 +599,44 @@ app.get('/api/payment-intent/diagnose/:intentId', async (req, res) => {
   }
 })
 
+app.get('/api/payments/mercadopago/pos/device-status', async (_req, res) => {
+  const { pointDeviceId } = config.mercadoPago
+  if (!pointDeviceId) {
+    return res.status(503).json({ error: 'Maquininha não configurada' })
+  }
+
+  try {
+    const discoveredIntentIds = await discoverPointIntentIds(pointDeviceId, 'device-status')
+
+    let device = null
+    try {
+      device = await mpRequest(`/point/integration-api/devices/${pointDeviceId}`)
+    } catch (err) {
+      return res.status(err.status || 500).json({
+        error: 'Falha ao consultar status do device',
+        details: {
+          status: err?.status,
+          payload: err?.payload,
+          message: err?.message,
+        },
+        discoveredIntentIds,
+      })
+    }
+
+    return res.json({
+      success: true,
+      pointDeviceId,
+      discoveredIntentIds,
+      device,
+    })
+  } catch (err) {
+    return res.status(500).json({
+      error: 'Erro ao diagnosticar device',
+      details: err?.message,
+    })
+  }
+})
+
 app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
   const { pointDeviceId } = config.mercadoPago
   if (!pointDeviceId) {
@@ -525,22 +653,21 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
     
     try {
       console.log('[clear-queue] listando intents da API...')
-      const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
-      const intents = Array.isArray(response) ? response : (Array.isArray(response?.results) ? response.results : [])
-      console.log(`[clear-queue] encontrados ${intents.length} intents`)
+      const intentIds = await discoverPointIntentIds(pointDeviceId, 'clear-queue')
+      console.log(`[clear-queue] encontrados ${intentIds.length} intents`)
 
-      for (const intent of intents) {
-        if (intent?.id) {
+      for (const intentId of intentIds) {
+        if (intentId) {
           try {
             await mpRequest(
-              `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intent.id}`,
+              `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intentId}`,
               { method: 'DELETE' },
             )
-            console.log(`[clear-queue] intent ${intent.id} deletado`)
+            console.log(`[clear-queue] intent ${intentId} deletado`)
             intentsDeleted++
           } catch (err) {
-            console.warn(`[clear-queue] falha ao deletar intent ${intent.id}:`, err?.payload?.error || err?.message)
-            intentsFailedToDelete.push(intent.id)
+            console.warn(`[clear-queue] falha ao deletar intent ${intentId}:`, err?.payload?.error || err?.message)
+            intentsFailedToDelete.push(intentId)
           }
         }
       }
@@ -780,16 +907,19 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
           // Cleanup agressivo em cada retry:
           // 1. Lista intents da API e deleta todos
           try {
-            const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
-            const intents = Array.isArray(response) ? response : (Array.isArray(response?.results) ? response.results : [])
-            for (const i of intents) {
-              if (i?.id) {
-                await cancelPointIntent(String(i.id))
+            const intentIds = await discoverPointIntentIds(pointDeviceId, 'pos/intent-retry')
+            for (const intentId of intentIds) {
+              if (intentId) {
+                await cancelPointIntent(String(intentId))
               }
             }
-            console.log(`[pos/intent] ${intents.length} intent(s) deletado(s) da API`)
+            console.log(`[pos/intent] ${intentIds.length} intent(s) deletado(s) da API/fallback`)
           } catch (e) {
-            console.warn(`[pos/intent] não conseguiu listar intents da API:`, e?.message)
+            console.warn(`[pos/intent] não conseguiu limpar intents via API/fallback:`, {
+              status: e?.status,
+              payload: e?.payload,
+              message: e?.message,
+            })
           }
 
           // 2. Cancela intents conhecidos pelo banco e remove vínculo
