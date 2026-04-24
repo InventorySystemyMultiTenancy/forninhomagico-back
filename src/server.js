@@ -818,10 +818,7 @@ app.post('/api/payments/mercadopago/pos/clear-queue', async (_req, res) => {
       for (const intentId of intentIds) {
         if (intentId) {
           try {
-            await mpRequest(
-              `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intentId}`,
-              { method: 'DELETE' },
-            )
+            await cancelPointIntent(String(intentId))
             console.log(`[clear-queue] intent ${intentId} deletado`)
             intentsDeleted++
           } catch (err) {
@@ -1073,8 +1070,19 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       console.warn(`[pos/intent] 409 detectado (fila travada), tentando limpeza rápida...`)
 
       try {
+        let intentsDeleted = 0
+        const intentIds = await discoverPointIntentIds(pointDeviceId, 'pos/intent-cleanup')
+        for (const intentId of intentIds) {
+          try {
+            await cancelPointIntent(String(intentId))
+            intentsDeleted++
+          } catch (deleteErr) {
+            console.warn(`[pos/intent] falha ao deletar intent ${intentId} no cleanup:`, deleteErr?.message)
+          }
+        }
+
         const dbCleanup = await cancelKnownIntentsFromDatabase('pos/intent-cleanup')
-        console.log(`[pos/intent] limpeza rápida: ${dbCleanup.cancelled} cancelados, ${dbCleanup.reconciled} reconciliados`)
+        console.log(`[pos/intent] limpeza rápida: ${intentsDeleted} deletados da API, ${dbCleanup.cancelled} cancelados no banco, ${dbCleanup.reconciled} reconciliados`)
       } catch (e) {
         console.warn(`[pos/intent] limpeza rápida falhou:`, e?.message)
       }
