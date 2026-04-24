@@ -403,19 +403,20 @@ async function clearPosOrder() {
 }
 
 async function cancelPointIntent(intentId) {
-  const { pointDeviceId } = config.mercadoPago
-  if (!pointDeviceId || !intentId) return
+  if (!intentId) return
 
   try {
+    // Rota correta da API: DELETE /point/integration-api/payment-intents/{intentId}
+    // (sem /devices/{deviceId}/ no path para cancelamento)
     await mpRequest(
-      `/point/integration-api/devices/${pointDeviceId}/payment-intents/${intentId}`,
+      `/point/integration-api/payment-intents/${intentId}`,
       { method: 'DELETE' },
     )
-    console.log(`[pos] intent ${intentId} cancelado na maquininha`)
+    console.log(`[pos] intent ${intentId} cancelado`)
   } catch (err) {
     // Não falha se intent não existe na API (pode ter já sido deletado)
     if (err?.status === 404) {
-      console.log(`[pos] intent ${intentId} já não existe na maquininha`)
+      console.log(`[pos] intent ${intentId} já não existe`)
       return
     }
     throw err // relança outros erros
@@ -483,53 +484,40 @@ function parseIntentIdsFromListResponse(response) {
 
 async function discoverPointIntentIds(pointDeviceId, sourceTag) {
   const ids = new Set()
+  const allOrders = await store.listOrders()
 
-  try {
-    const response = await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`)
-    for (const id of parseIntentIdsFromListResponse(response)) ids.add(id)
-  } catch (err) {
-    console.warn(`[${sourceTag}] falha ao listar intents por devices/:id/payment-intents:`, {
-      status: err?.status,
-      payload: err?.payload,
-      message: err?.message,
-    })
+  // Estratégia: consultar status de cada intent conhecido no banco
+  // A API não fornece listagem de intents por device, então fazemos lookup por ordem
+  for (const order of allOrders) {
+    if (!order.paymentIntentId) continue
+
+    try {
+      const intent = await mpRequest(`/point/integration-api/payment-intents/${order.paymentIntentId}`)
+      // Se consegui consultar, intent ainda existe
+      ids.add(order.paymentIntentId)
+    } catch (err) {
+      // Se 404, intent não existe mais (foi deletado ou expirou)
+      if (err?.status !== 404) {
+        console.warn(`[${sourceTag}] falha ao consultar intent ${order.paymentIntentId}:`, {
+          status: err?.status,
+          payload: err?.payload,
+        })
+      }
+    }
   }
 
-  if (ids.size > 0) return Array.from(ids)
-
-  // Fallback: alguns ambientes retornam apenas estado/intent atual via endpoint de device.
-  try {
-    const device = await mpRequest(`/point/integration-api/devices/${pointDeviceId}`)
-    const discovered = collectIntentIdsFromUnknown(device)
-    for (const id of discovered) ids.add(id)
-    if (ids.size > 0) {
-      console.log(`[${sourceTag}] intents descobertos via endpoint de device: ${Array.from(ids).join(', ')}`)
-    }
-  } catch (err) {
-    console.warn(`[${sourceTag}] falha ao consultar status do device para descobrir intents:`, {
-      status: err?.status,
-      payload: err?.payload,
-      message: err?.message,
-    })
+  if (ids.size > 0) {
+    console.log(`[${sourceTag}] intents vivos descobertos: ${Array.from(ids).join(', ')}`)
   }
 
   return Array.from(ids)
 }
 
 async function forceClearDeviceQueue(pointDeviceId, sourceTag) {
-  // Alguns ambientes não suportam listagem por GET, mas aceitam DELETE no recurso da fila.
-  try {
-    await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`, { method: 'DELETE' })
-    console.log(`[${sourceTag}] fila do device limpa via DELETE em /devices/:id/payment-intents`)
-    return true
-  } catch (err) {
-    console.warn(`[${sourceTag}] DELETE direto na fila do device não suportado:`, {
-      status: err?.status,
-      payload: err?.payload,
-      message: err?.message,
-    })
-    return false
-  }
+  // Nota: A API do Mercado Pago não fornece um endpoint para limpar toda a fila por device
+  // Devemos cancelar intents conhecidos um a um
+  console.log(`[${sourceTag}] note: não existe endpoint para limpar fila por device, removendo intents conhecidos...`)
+  return false
 }
 
 async function cancelKnownIntentsFromDatabase(sourceTag) {
