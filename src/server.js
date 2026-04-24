@@ -516,6 +516,48 @@ async function discoverPointIntentIds(pointDeviceId, sourceTag) {
   return Array.from(ids)
 }
 
+async function forceClearDeviceQueue(pointDeviceId, sourceTag) {
+  // Alguns ambientes não suportam listagem por GET, mas aceitam DELETE no recurso da fila.
+  try {
+    await mpRequest(`/point/integration-api/devices/${pointDeviceId}/payment-intents`, { method: 'DELETE' })
+    console.log(`[${sourceTag}] fila do device limpa via DELETE em /devices/:id/payment-intents`)
+    return true
+  } catch (err) {
+    console.warn(`[${sourceTag}] DELETE direto na fila do device não suportado:`, {
+      status: err?.status,
+      payload: err?.payload,
+      message: err?.message,
+    })
+    return false
+  }
+}
+
+async function cancelKnownIntentsFromDatabase(sourceTag) {
+  const allOrders = await store.listOrders()
+  let cancelled = 0
+  let reconciled = 0
+
+  for (const order of allOrders) {
+    if (!order.paymentIntentId) continue
+
+    const wasReconciled = await reconcileOrderByPointIntent(order, sourceTag)
+    if (wasReconciled) {
+      reconciled++
+      continue
+    }
+
+    try {
+      await cancelPointIntent(order.paymentIntentId)
+      await store.attachPaymentIntent(order.id, null)
+      cancelled++
+    } catch (err) {
+      console.warn(`[${sourceTag}] falha ao cancelar intent ${order.paymentIntentId} do pedido ${order.id}:`, err?.message)
+    }
+  }
+
+  return { cancelled, reconciled }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.get('/api/orders/:id', async (req, res) => {
@@ -861,11 +903,22 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
     }
 
-    // Idempotência: se já existe intent ativo, retorna sem criar novo
+    // Comportamento solicitado: sempre substituir intent anterior por uma nova tentativa.
     if (order.paymentIntentId) {
-      console.log(`[pos/intent] intent ${order.paymentIntentId} já existe para pedido ${order.id}`)
-      return res.json({ success: true, intentId: order.paymentIntentId, orderId: order.id, totalCents: order.totalCents })
+      console.log(`[pos/intent] pedido ${order.id} já tinha intent ${order.paymentIntentId}; cancelando antes de criar nova`)
+      try {
+        await cancelPointIntent(order.paymentIntentId)
+      } catch (err) {
+        console.warn(`[pos/intent] não foi possível cancelar intent antiga ${order.paymentIntentId}:`, err?.message)
+      }
+      await store.attachPaymentIntent(order.id, null)
     }
+
+    // Limpeza preventiva da fila no device antes da criação (best effort)
+    await forceClearDeviceQueue(pointDeviceId, 'pos/intent-preflight')
+
+    const preflightDbCleanup = await cancelKnownIntentsFromDatabase('pos/intent-preflight')
+    console.log(`[pos/intent] preflight concluído (${preflightDbCleanup.cancelled} cancelados, ${preflightDbCleanup.reconciled} reconciliados)`)
 
     const body = {
       amount: order.totalCents,
@@ -904,6 +957,8 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
         if (attempt < MAX_RETRIES) {
           console.log(`[pos/intent] tentativa ${attempt}/${MAX_RETRIES}: 409 detectado, limpando intents...`)
 
+          await forceClearDeviceQueue(pointDeviceId, 'pos/intent-retry')
+
           // Cleanup agressivo em cada retry:
           // 1. Lista intents da API e deleta todos
           try {
@@ -924,27 +979,8 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
 
           // 2. Cancela intents conhecidos pelo banco e remove vínculo
           try {
-            const allOrders = await store.listOrders('aguardando pagamento')
-            let cancelledFromDb = 0
-            let reconciledFromDb = 0
-            for (const o of allOrders) {
-              if (o.paymentIntentId) {
-                try {
-                  const reconciled = await reconcileOrderByPointIntent(o, 'pos/intent-retry')
-                  if (reconciled) {
-                    reconciledFromDb++
-                    continue
-                  }
-
-                  await cancelPointIntent(o.paymentIntentId)
-                  await store.attachPaymentIntent(o.id, null)
-                  cancelledFromDb++
-                } catch (cancelErr) {
-                  console.warn(`[pos/intent] falha ao cancelar intent ${o.paymentIntentId} no device:`, cancelErr?.message)
-                }
-              }
-            }
-            console.log(`[pos/intent] intents tratados no fallback (${cancelledFromDb} cancelados, ${reconciledFromDb} reconciliados)`)
+            const dbCleanup = await cancelKnownIntentsFromDatabase('pos/intent-retry')
+            console.log(`[pos/intent] intents tratados no fallback (${dbCleanup.cancelled} cancelados, ${dbCleanup.reconciled} reconciliados)`)
           } catch (e) {
             console.warn(`[pos/intent] erro ao atualizar banco:`, e?.message)
           }
