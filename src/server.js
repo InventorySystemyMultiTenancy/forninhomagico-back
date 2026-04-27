@@ -6,6 +6,14 @@ const { z } = require('zod')
 const crypto = require('crypto')
 const { config } = require('./config')
 const store = require('./store')
+const {
+  authenticateToken,
+  comparePassword,
+  hashPassword,
+  requireRole,
+  sanitizeUser,
+  signToken,
+} = require('./auth')
 
 const app = express()
 const upload = multer({
@@ -77,6 +85,11 @@ const paymentIntentSchema = z.object({
   orderId: z.number().int(),
 })
 
+const authLoginSchema = z.object({
+  username: z.string().min(1),
+  password: z.string().min(1),
+})
+
 // Map de watchers de intent Point ativos: intentId -> intervalId
 const pointIntentWatchers = new Map()
 
@@ -85,6 +98,8 @@ const pointDeviceActiveIntents = new Map()
 
 // Map de watchers de pagamento PIX ativos: paymentId -> intervalId
 const pixPaymentWatchers = new Map()
+
+const requireAdmin = requireRole('ADMIN')
 
 async function mpRequest(path, options = {}) {
   if (!config.mercadoPago.accessToken) {
@@ -231,7 +246,7 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'forninho-backend' })
 })
 
-app.post('/api/upload', upload.single('image'), async (req, res) => {
+app.post('/api/upload', authenticateToken, requireAdmin, upload.single('image'), async (req, res) => {
   if (!config.cloudinary.cloudName || !config.cloudinary.apiKey || !config.cloudinary.apiSecret) {
     return res.status(500).json({ error: 'Cloudinary not configured' })
   }
@@ -356,12 +371,134 @@ app.get('/api/orders', async (req, res) => {
 
 app.get('/api/orders/ready', async (_req, res) => {
   try {
-    res.json(await store.listOrders('pronto'))
+    const readyOrders = await store.listOrders('pronto')
+    res.json(readyOrders.map((order) => ({
+      id: order.id,
+      code: order.code,
+      flavorName: order.flavorName,
+      customerName: order.customerName,
+      status: order.status,
+    })))
   } catch (err) {
     console.error('[GET /api/orders/ready] erro:', err)
     res.status(500).json({ error: 'Internal server error', detail: err.message })
   }
 })
+
+app.get('/api/public/orders/ready', async (_req, res) => {
+  try {
+    const readyOrders = await store.listOrders('pronto')
+    res.json(readyOrders.map((order) => ({
+      id: order.id,
+      code: order.code,
+      flavorName: order.flavorName,
+      customerName: order.customerName,
+      status: order.status,
+    })))
+  } catch (err) {
+    console.error('[GET /api/public/orders/ready] erro:', err)
+    res.status(500).json({ error: 'Internal server error', detail: err.message })
+  }
+})
+
+function isPublicApiRoute(method, pathname) {
+  if (method === 'GET' && pathname === '/api/health') return true
+  if (method === 'POST' && pathname === '/api/auth/login') return true
+  if (method === 'GET' && pathname === '/api/flavors') return true
+  if (method === 'GET' && pathname === '/api/orders/ready') return true
+  if (method === 'GET' && pathname === '/api/public/orders/ready') return true
+  if (method === 'GET' && /^\/api\/orders\/[^/]+$/.test(pathname)) return true
+  if (method === 'POST' && pathname === '/api/notifications/mercadopago') return true
+  if (method === 'GET' && pathname === '/api/notifications/mercadopago') return true
+  if (method === 'POST' && pathname === '/api/payments/mercadopago/pos/webhook') return true
+  return false
+}
+
+function isUserAccessibleRoute(method, pathname) {
+  if (isPublicApiRoute(method, pathname)) return true
+  if (method === 'GET' && pathname === '/api/auth/me') return true
+  return false
+}
+
+app.use('/api', (req, res, next) => {
+  const pathname = req.originalUrl.split('?')[0]
+
+  if (isPublicApiRoute(req.method, pathname)) {
+    return next()
+  }
+
+  if (pathname === '/api/auth/me') {
+    return authenticateToken(req, res, next)
+  }
+
+  if (pathname === '/api/auth/login') {
+    return next()
+  }
+
+  return authenticateToken(req, res, () => {
+    if (req.user?.role !== 'ADMIN' && !isUserAccessibleRoute(req.method, pathname)) {
+      return res.status(403).json({ error: 'Acesso negado.' })
+    }
+    return next()
+  })
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  const parsed = authLoginSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() })
+  }
+
+  try {
+    const user = await store.findUserByUsername(parsed.data.username)
+    const passwordOk = user ? await comparePassword(parsed.data.password, user.passwordHash) : false
+
+    if (!user || !passwordOk || !user.isActive) {
+      return res.status(401).json({ error: 'Credenciais inválidas' })
+    }
+
+    const token = signToken(sanitizeUser(user))
+    return res.status(200).json({
+      token,
+      accessToken: token,
+      user: sanitizeUser(user),
+    })
+  } catch (err) {
+    console.error('[POST /api/auth/login] erro:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  return res.status(200).json({ user: req.user })
+})
+
+async function initializeAuthUsers() {
+  await store.ensureUsersTable()
+
+  const adminHash = await hashPassword('admin123')
+  const userHash = await hashPassword('operador123')
+
+  const existingAdmin = await store.findUserByUsername('admin')
+  if (!existingAdmin) {
+    await store.upsertUser({
+      username: 'admin',
+      name: 'Ana Admin',
+      passwordHash: adminHash,
+      role: 'ADMIN',
+    })
+  }
+
+  const existingUser = await store.findUserByUsername('operador')
+  if (!existingUser) {
+    await store.upsertUser({
+      username: 'operador',
+      name: 'Operador',
+      passwordHash: userHash,
+      role: 'USER',
+    })
+  }
+}
 
 app.post('/api/orders', async (req, res) => {
   const parsed = orderSchema.safeParse(req.body)
@@ -2124,6 +2261,20 @@ app.use((_req, res) => {
   res.status(404).json({ error: 'Route not found' })
 })
 
-app.listen(config.port, () => {
-  console.log(`Backend running on port ${config.port}`)
-})
+async function bootstrap() {
+  try {
+    await initializeAuthUsers()
+    app.listen(config.port, () => {
+      console.log(`Backend running on port ${config.port}`)
+    })
+  } catch (err) {
+    console.error('Failed to bootstrap backend:', err)
+    process.exitCode = 1
+  }
+}
+
+if (require.main === module) {
+  bootstrap()
+}
+
+module.exports = { app, bootstrap, initializeAuthUsers }

@@ -296,6 +296,92 @@ async function createPayment(payload) {
   return rows[0]
 }
 
+// ─── Users / Auth ─────────────────────────────────────────────────────────────
+
+async function ensureUsersTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'USER' CHECK (role IN ('ADMIN', 'USER')),
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `)
+}
+
+function rowToUser(row) {
+  if (!row) return null
+  return {
+    id: row.id,
+    username: row.username,
+    name: row.name,
+    role: row.role,
+    isActive: row.is_active,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+async function findUserByUsername(username) {
+  const { rows } = await db.query(
+    `SELECT id, username, name, password_hash, role, is_active, created_at, updated_at
+     FROM users
+     WHERE LOWER(username) = LOWER($1)
+     LIMIT 1`,
+    [username],
+  )
+  return rows[0]
+    ? {
+        ...rowToUser(rows[0]),
+        passwordHash: rows[0].password_hash,
+      }
+    : null
+}
+
+async function findUserById(id) {
+  const { rows } = await db.query(
+    `SELECT id, username, name, role, is_active, created_at, updated_at
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [id],
+  )
+  return rowToUser(rows[0])
+}
+
+async function upsertUser({ username, name, passwordHash, role }) {
+  const normalizedUsername = String(username || '').trim().toLowerCase()
+  const normalizedRole = String(role || 'USER').toUpperCase()
+
+  const { rows } = await db.query(
+    `INSERT INTO users (username, name, password_hash, role)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (username)
+     DO UPDATE SET
+       name = EXCLUDED.name,
+       password_hash = EXCLUDED.password_hash,
+       role = EXCLUDED.role,
+       is_active = TRUE,
+       updated_at = NOW()
+     RETURNING id, username, name, role, is_active, created_at, updated_at`,
+    [normalizedUsername, name, passwordHash, normalizedRole],
+  )
+  return rowToUser(rows[0])
+}
+
+async function listUsers() {
+  const { rows } = await db.query(
+    `SELECT id, username, name, role, is_active, created_at, updated_at
+     FROM users
+     ORDER BY id ASC`,
+  )
+  return rows.map(rowToUser)
+}
+
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
 async function getStats() {
@@ -351,6 +437,11 @@ module.exports = {
   updateOrderFromPayment,
   cancelOrder,
   createPayment,
+  ensureUsersTable,
+  findUserByUsername,
+  findUserById,
+  upsertUser,
+  listUsers,
   getStats,
   getFinancials,
 }
