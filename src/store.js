@@ -305,6 +305,7 @@ async function ensureUsersTable() {
       username TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
       password_hash TEXT NOT NULL,
+      phone TEXT NOT NULL UNIQUE,
       role TEXT NOT NULL DEFAULT 'USER' CHECK (role IN ('ADMIN', 'USER')),
       is_active BOOLEAN NOT NULL DEFAULT TRUE,
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -319,6 +320,7 @@ function rowToUser(row) {
     id: row.id,
     username: row.username,
     name: row.name,
+    phone: row.phone,
     role: row.role,
     isActive: row.is_active,
     createdAt: row.created_at,
@@ -328,7 +330,7 @@ function rowToUser(row) {
 
 async function findUserByUsername(username) {
   const { rows } = await db.query(
-    `SELECT id, username, name, password_hash, role, is_active, created_at, updated_at
+    `SELECT id, username, name, password_hash, phone, role, is_active, created_at, updated_at
      FROM users
      WHERE LOWER(username) = LOWER($1)
      LIMIT 1`,
@@ -344,7 +346,7 @@ async function findUserByUsername(username) {
 
 async function findUserById(id) {
   const { rows } = await db.query(
-    `SELECT id, username, name, role, is_active, created_at, updated_at
+    `SELECT id, username, name, phone, role, is_active, created_at, updated_at
      FROM users
      WHERE id = $1
      LIMIT 1`,
@@ -353,29 +355,47 @@ async function findUserById(id) {
   return rowToUser(rows[0])
 }
 
-async function upsertUser({ username, name, passwordHash, role }) {
+async function findUserByPhone(phone) {
+  const { rows } = await db.query(
+    `SELECT id, username, name, password_hash, phone, role, is_active, created_at, updated_at
+     FROM users
+     WHERE phone = $1
+     LIMIT 1`,
+    [phone],
+  )
+  return rows[0]
+    ? {
+        ...rowToUser(rows[0]),
+        passwordHash: rows[0].password_hash,
+      }
+    : null
+}
+
+async function upsertUser({ username, name, passwordHash, phone, role }) {
   const normalizedUsername = String(username || '').trim().toLowerCase()
   const normalizedRole = String(role || 'USER').toUpperCase()
+  const normalizedPhone = String(phone || '').trim()
 
   const { rows } = await db.query(
-    `INSERT INTO users (username, name, password_hash, role)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO users (username, name, password_hash, phone, role)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (username)
      DO UPDATE SET
        name = EXCLUDED.name,
        password_hash = EXCLUDED.password_hash,
+       phone = EXCLUDED.phone,
        role = EXCLUDED.role,
        is_active = TRUE,
        updated_at = NOW()
-     RETURNING id, username, name, role, is_active, created_at, updated_at`,
-    [normalizedUsername, name, passwordHash, normalizedRole],
+     RETURNING id, username, name, phone, role, is_active, created_at, updated_at`,
+    [normalizedUsername, name, passwordHash, normalizedPhone, normalizedRole],
   )
   return rowToUser(rows[0])
 }
 
 async function listUsers() {
   const { rows } = await db.query(
-    `SELECT id, username, name, role, is_active, created_at, updated_at
+    `SELECT id, username, name, phone, role, is_active, created_at, updated_at
      FROM users
      ORDER BY id ASC`,
   )
@@ -440,6 +460,7 @@ module.exports = {
   ensureUsersTable,
   findUserByUsername,
   findUserById,
+  findUserByPhone,
   upsertUser,
   listUsers,
   getStats,

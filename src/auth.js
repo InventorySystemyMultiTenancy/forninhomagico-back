@@ -14,6 +14,7 @@ function sanitizeUser(user) {
     id: user.id,
     username: user.username,
     name: user.name,
+    phone: user.phone,
     role: normalizeRole(user.role),
   }
 }

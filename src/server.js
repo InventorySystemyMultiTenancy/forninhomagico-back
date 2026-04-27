@@ -90,6 +90,18 @@ const authLoginSchema = z.object({
   password: z.string().min(1),
 })
 
+const authSignupSchema = z.object({
+  username: z.string().min(3).max(30),
+  name: z.string().min(2).max(100),
+  password: z.string().min(6),
+  phone: z.string().regex(/^\d{10,11}$/, 'Telefone deve conter 10 ou 11 dígitos'),
+})
+
+const authChangePasswordSchema = z.object({
+  phone: z.string().regex(/^\d{10,11}$/, 'Telefone deve conter 10 ou 11 dígitos'),
+  newPassword: z.string().min(6),
+})
+
 // Map de watchers de intent Point ativos: intentId -> intervalId
 const pointIntentWatchers = new Map()
 
@@ -404,6 +416,8 @@ app.get('/api/public/orders/ready', async (_req, res) => {
 function isPublicApiRoute(method, pathname) {
   if (method === 'GET' && pathname === '/api/health') return true
   if (method === 'POST' && pathname === '/api/auth/login') return true
+  if (method === 'POST' && pathname === '/api/auth/signup') return true
+  if (method === 'POST' && pathname === '/api/auth/change-password') return true
   if (method === 'GET' && pathname === '/api/flavors') return true
   if (method === 'GET' && pathname === '/api/orders/ready') return true
   if (method === 'GET' && pathname === '/api/public/orders/ready') return true
@@ -469,9 +483,94 @@ app.post('/api/auth/login', async (req, res) => {
   }
 })
 
+app.post('/api/auth/signup', async (req, res) => {
+  const parsed = authSignupSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() })
+  }
+
+  try {
+    // Verifica se usuário já existe
+    const existingUser = await store.findUserByUsername(parsed.data.username)
+    if (existingUser) {
+      return res.status(409).json({ error: 'Usuário já existe' })
+    }
+
+    // Verifica se telefone já está registrado
+    const existingPhone = await store.findUserByPhone(parsed.data.phone)
+    if (existingPhone) {
+      return res.status(409).json({ error: 'Telefone já cadastrado' })
+    }
+
+    // Cria novo usuário
+    const passwordHash = await hashPassword(parsed.data.password)
+    const newUser = await store.upsertUser({
+      username: parsed.data.username,
+      name: parsed.data.name,
+      passwordHash,
+      phone: parsed.data.phone,
+      role: 'USER',
+    })
+
+    const token = signToken(sanitizeUser(newUser))
+    return res.status(201).json({
+      token,
+      accessToken: token,
+      user: sanitizeUser(newUser),
+    })
+  } catch (err) {
+    console.error('[POST /api/auth/signup] erro:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.post('/api/auth/change-password', async (req, res) => {
+  const parsed = authChangePasswordSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() })
+  }
+
+  try {
+    // Busca usuário pelo telefone
+    const user = await store.findUserByPhone(parsed.data.phone)
+    if (!user || !user.isActive) {
+      return res.status(404).json({ error: 'Usuário não encontrado' })
+    }
+
+    // Atualiza senha
+    const newPasswordHash = await hashPassword(parsed.data.newPassword)
+    const updatedUser = await store.upsertUser({
+      username: user.username,
+      name: user.name,
+      passwordHash: newPasswordHash,
+      phone: user.phone,
+      role: user.role,
+    })
+
+    const token = signToken(sanitizeUser(updatedUser))
+    return res.status(200).json({
+      message: 'Senha alterada com sucesso',
+      token,
+      accessToken: token,
+      user: sanitizeUser(updatedUser),
+    })
+  } catch (err) {
+    console.error('[POST /api/auth/change-password] erro:', err)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   return res.status(200).json({ user: req.user })
 })
+
+function generateRandomPhone() {
+  // Gera número de telefone aleatório: 11 9XXXXXXXX
+  const areaCode = '11'
+  const firstPart = '9'
+  const randomPart = Math.floor(Math.random() * 100000000).toString().padStart(8, '0')
+  return areaCode + firstPart + randomPart
+}
 
 async function initializeAuthUsers() {
   await store.ensureUsersTable()
@@ -485,6 +584,7 @@ async function initializeAuthUsers() {
       username: 'admin',
       name: 'Ana Admin',
       passwordHash: adminHash,
+      phone: '11987654321',
       role: 'ADMIN',
     })
   }
@@ -495,6 +595,7 @@ async function initializeAuthUsers() {
       username: 'operador',
       name: 'Operador',
       passwordHash: userHash,
+      phone: '11987654322',
       role: 'USER',
     })
   }
