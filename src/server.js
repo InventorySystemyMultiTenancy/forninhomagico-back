@@ -80,6 +80,9 @@ const paymentIntentSchema = z.object({
 // Map de watchers de intent Point ativos: intentId -> intervalId
 const pointIntentWatchers = new Map()
 
+// Última intent Point conhecida por device: deviceId -> { intentId, orderId, updatedAt }
+const pointDeviceActiveIntents = new Map()
+
 // Map de watchers de pagamento PIX ativos: paymentId -> intervalId
 const pixPaymentWatchers = new Map()
 
@@ -453,6 +456,41 @@ async function cancelPointIntent(intentId) {
       return
     }
     throw err // relança outros erros (error de conexão, etc)
+  }
+}
+
+function rememberPointDeviceIntent(pointDeviceId, intentId, orderId) {
+  if (!pointDeviceId || !intentId) return
+  pointDeviceActiveIntents.set(pointDeviceId, {
+    intentId: String(intentId),
+    orderId: orderId ? Number(orderId) : null,
+    updatedAt: new Date().toISOString(),
+  })
+}
+
+function forgetPointDeviceIntent(pointDeviceId, intentId) {
+  if (!pointDeviceId) return
+  const current = pointDeviceActiveIntents.get(pointDeviceId)
+  if (!current) return
+  if (!intentId || current.intentId === String(intentId)) {
+    pointDeviceActiveIntents.delete(pointDeviceId)
+  }
+}
+
+async function cancelTrackedPointIntentForDevice(pointDeviceId, sourceTag) {
+  if (!pointDeviceId) return false
+
+  const tracked = pointDeviceActiveIntents.get(pointDeviceId)
+  if (!tracked?.intentId) return false
+
+  console.log(`[${sourceTag}] cancelando intent ativa do device ${pointDeviceId}: ${tracked.intentId}`)
+  try {
+    await cancelPointIntent(tracked.intentId)
+    pointDeviceActiveIntents.delete(pointDeviceId)
+    return true
+  } catch (err) {
+    console.warn(`[${sourceTag}] falha ao cancelar intent ativa ${tracked.intentId} do device ${pointDeviceId}:`, err?.message)
+    return false
   }
 }
 
@@ -1051,7 +1089,10 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
       return res.status(400).json({ error: `Pedido não está aguardando pagamento (status: ${order.status})` })
     }
 
-    // Comportamento solicitado: sempre substituir intent anterior por uma nova tentativa.
+    // Sempre derruba a intent ativa do device antes de enviar a nova.
+    await cancelTrackedPointIntentForDevice(pointDeviceId, 'pos/intent-priority')
+
+    // Se o pedido atual ainda tiver intent antiga associada, limpa também.
     if (order.paymentIntentId) {
       console.log(`[pos/intent] pedido ${order.id} já tinha intent ${order.paymentIntentId}; cancelando antes de criar nova`)
       // Para o watcher deste intent ANTES de tentar cancelar
@@ -1154,6 +1195,7 @@ app.post('/api/payments/mercadopago/pos/intent', async (req, res) => {
     }
 
     await store.attachPaymentIntent(order.id, intent.id)
+    rememberPointDeviceIntent(pointDeviceId, intent.id, order.id)
     
     // Inicia monitoramento automático do intent
     startPointIntentWatcher(intent.id, order.id)
@@ -1434,6 +1476,7 @@ async function processPointOrderNotification(orderId, notificationBody, sourceTa
       // ✅ Pagamento confirmado - transição para "em montagem"
       console.log(`[${sourceTag}] ✅ Pagamento processado: order ${orderId}`, { paymentStatus, detail: payment.status_detail })
       await store.updateOrderFromPayment(order.id, paymentId, 'approved')
+      forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, paymentId || order.paymentIntentId)
       await releasePointQueueForOrder(order, sourceTag)
     } else if (action === 'order.action_required') {
       // ⏳ Aguardando confirmação no terminal
@@ -1441,14 +1484,17 @@ async function processPointOrderNotification(orderId, notificationBody, sourceTa
     } else if (action === 'order.failed' && orderStatus === 'failed') {
       // ❌ Pagamento rejeitado
       console.log(`[${sourceTag}] ❌ Pagamento falhou: order ${orderId}`, { reason: payment.status_detail })
+      forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, paymentId || order.paymentIntentId)
       await store.attachPaymentIntent(order.id, null)
     } else if (action === 'order.canceled' && orderStatus === 'canceled') {
       // ❌ Cancelado
       console.log(`[${sourceTag}] ❌ Order cancelada: ${orderId}`)
+      forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, paymentId || order.paymentIntentId)
       await store.attachPaymentIntent(order.id, null)
     } else if (action === 'order.expired' && orderStatus === 'expired') {
       // ⏱️ Expirou
       console.log(`[${sourceTag}] ⏱️ Order expirada: ${orderId}`)
+      forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, paymentId || order.paymentIntentId)
       await store.attachPaymentIntent(order.id, null)
     } else if (action !== 'order.refunded') {
       // order.refunded é ignorado por enquanto
@@ -1679,8 +1725,10 @@ function startPixPaymentWatcher(paymentId, orderId) {
 
 async function releasePointQueueForOrder(order, sourceTag) {
   if (!order?.paymentIntentId) return
+  const { pointDeviceId } = config.mercadoPago
   try {
     await cancelPointIntent(order.paymentIntentId)
+    forgetPointDeviceIntent(pointDeviceId, order.paymentIntentId)
   } catch (err) {
     console.warn(`[${sourceTag}] falha ao cancelar intent ${order.paymentIntentId} durante release:`, err?.message)
   }
@@ -1764,6 +1812,7 @@ async function processPaymentNotification(paymentId, sourceTag) {
       
       // Limpa fila Point se for pagamento Point
       if (!isPix) {
+        forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, mpPaymentId)
         await releasePointQueueForOrder(order, sourceTag)
         await clearPosOrder()
       }
@@ -1775,6 +1824,7 @@ async function processPaymentNotification(paymentId, sourceTag) {
       
       // Limpa fila Point se for pagamento Point
       if (!isPix) {
+        forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, mpPaymentId)
         await releasePointQueueForOrder(order, sourceTag)
       }
     }
@@ -1843,10 +1893,12 @@ async function processPointIntentNotification(intentId, sourceTag) {
         receiptCode: updated.code,
       })
       console.log(`[${sourceTag}] ✅ point_intent ${intentId} APROVADO para pedido ${order.id}`)
+      forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, intentId)
       await releasePointQueueForOrder(order, sourceTag)
       await clearPosOrder()
     } else if (normalizedStatus === 'rejected' || normalizedStatus === 'cancelled') {
       console.log(`[${sourceTag}] ❌ point_intent ${intentId} ${normalizedStatus.toUpperCase()} para pedido ${order.id}`)
+      forgetPointDeviceIntent(config.mercadoPago.pointDeviceId, intentId)
       await releasePointQueueForOrder(order, sourceTag)
     } else {
       console.log(`[${sourceTag}] ⏳ point_intent ${intentId} status ${normalizedStatus} para pedido ${order.id}, aguardando...`)
